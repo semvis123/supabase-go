@@ -223,7 +223,7 @@ func main() {
 
 - [x] Auth support (1)
 - [x] DB support (2)
-- [x] Realtime
+- [x] Realtime (WIP)
 - [x] Storage
 - [ ] Testing
 
