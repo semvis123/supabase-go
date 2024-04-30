@@ -11,20 +11,23 @@ import (
 )
 
 const (
-	AuthEndpoint    = "auth/v1"
-	AdminEndpoint   = "auth/v1/admin"
-	RestEndpoint    = "rest/v1"
-	StorageEndpoint = "storage/v1"
+	AuthEndpoint     = "auth/v1"
+	AdminEndpoint    = "auth/v1/admin"
+	RestEndpoint     = "rest/v1"
+	StorageEndpoint  = "storage/v1"
+	RealtimeEndpoint = "realtime/v1"
 )
 
 type Client struct {
 	BaseURL string
 	// apiKey can be a client API key or a service key
 	apiKey     string
+	Headers    map[string]string
 	HTTPClient *http.Client
 	Admin      *Admin
 	Auth       *Auth
 	Storage    *Storage
+	Realtime   *Realtime
 	DB         *postgrest.Client
 }
 
@@ -44,11 +47,13 @@ func CreateClient(baseURL string, supabaseKey string, debug ...bool) *Client {
 		panic(err)
 	}
 	client := &Client{
-		BaseURL: baseURL,
-		apiKey:  supabaseKey,
-		Admin:   &Admin{},
-		Auth:    &Auth{},
-		Storage: &Storage{},
+		BaseURL:  baseURL,
+		apiKey:   supabaseKey,
+		Headers:  nil,
+		Admin:    &Admin{},
+		Auth:     &Auth{},
+		Storage:  &Storage{},
+		Realtime: &Realtime{},
 		HTTPClient: &http.Client{
 			Timeout: time.Minute,
 		},
@@ -68,6 +73,47 @@ func CreateClient(baseURL string, supabaseKey string, debug ...bool) *Client {
 	client.Admin.serviceKey = supabaseKey
 	client.Auth.client = client
 	client.Storage.client = client
+	client.Realtime.client = client
+	return client
+}
+
+// CreateClient creates a new Supabase client
+func CreateClientWithHeaders(baseURL string, supabaseKey string, headers map[string]string, debug ...bool) *Client {
+	parsedURL, err := url.Parse(fmt.Sprintf("%s/%s/", baseURL, RestEndpoint))
+	if err != nil {
+		panic(err)
+	}
+	client := &Client{
+		BaseURL:  baseURL,
+		apiKey:   supabaseKey,
+		Headers:  headers,
+		Admin:    &Admin{},
+		Auth:     &Auth{},
+		Storage:  &Storage{},
+		Realtime: &Realtime{},
+		HTTPClient: &http.Client{
+			Timeout: time.Minute,
+		},
+		DB: postgrest.NewClient(
+			*parsedURL,
+			postgrest.WithTokenAuth(supabaseKey),
+			func(c *postgrest.Client) {
+				// debug parameter is only for postgrest-go for now
+				if len(debug) > 0 {
+					c.Debug = debug[0]
+				}
+				c.AddHeader("apikey", supabaseKey)
+				for key, val := range headers {
+					c.AddHeader(key, val)
+				}
+			},
+		),
+	}
+	client.Admin.client = client
+	client.Admin.serviceKey = supabaseKey
+	client.Auth.client = client
+	client.Storage.client = client
+	client.Realtime.client = client
 	return client
 }
 
@@ -90,6 +136,10 @@ func (c *Client) sendRequest(req *http.Request, v interface{}) error {
 
 func (c *Client) sendCustomRequest(req *http.Request, successValue interface{}, errorValue interface{}) (bool, error) {
 	req.Header.Set("apikey", c.apiKey)
+	for key, val := range c.Headers {
+		req.Header.Set(key, val)
+	}
+
 	res, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return true, err
