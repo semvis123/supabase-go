@@ -56,11 +56,11 @@ func (r *Realtime) Channel(topic string) *Channel {
 	websocketUrl = strings.Replace(websocketUrl, "https://", "wss://", 1)
 	websocketUrl = strings.Replace(websocketUrl, "http://", "ws://", 1)
 	websocketUrl = fmt.Sprintf("%s/ws", websocketUrl)
-	return &Channel{topic, websocketUrl, "", nil, nil, false, make(chan struct{})}
+	return &Channel{topic, websocketUrl, "http://localhost/", nil, nil, false, make(chan struct{})}
 }
 
 func (r *Realtime) ChannelWithUrl(topic string, websocketUrl string) *Channel {
-	return &Channel{topic, websocketUrl, "", nil, nil, false, make(chan struct{})}
+	return &Channel{topic, websocketUrl, "http://localhost/", nil, nil, false, make(chan struct{})}
 }
 
 func (c *Channel) Listen() error {
