@@ -1,4 +1,4 @@
-module github.com/nedpals/supabase-go
+module github.com/semvis123/supabase-go
 
 go 1.22
 

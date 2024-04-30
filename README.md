@@ -5,7 +5,7 @@ Unofficial [Supabase](https://supabase.io) client for Go. It is an amalgamation 
 ## Installation
 
 ```
-go get github.com/nedpals/supabase-go
+go get github.com/semvis123/supabase-go
 ```
 
 ## Usage
@@ -17,7 +17,7 @@ Replace the `<SUPABASE-URL>` and `<SUPABASE-URL>` placeholders with values from 
 ```go
 package main
 import (
-    supa "github.com/nedpals/supabase-go"
+    supa "github.com/semvis123/supabase-go"
     "fmt"
     "context"
 )
@@ -45,7 +45,7 @@ func main() {
 ```go
 package main
 import (
-    supa "github.com/nedpals/supabase-go"
+    supa "github.com/semvis123/supabase-go"
     "fmt"
     "context"
 )
@@ -73,7 +73,7 @@ func main() {
 ```go
 package main
 import (
-    supa "github.com/nedpals/supabase-go"
+    supa "github.com/semvis123/supabase-go"
     "fmt"
 )
 
@@ -109,7 +109,7 @@ func main() {
 ```go
 package main
 import (
-    supa "github.com/nedpals/supabase-go"
+    supa "github.com/semvis123/supabase-go"
     "fmt"
 )
 
@@ -133,7 +133,7 @@ func main() {
 ```go
 package main
 import (
-    supa "github.com/nedpals/supabase-go"
+    supa "github.com/semvis123/supabase-go"
     "fmt"
 )
 
@@ -167,7 +167,7 @@ func main() {
 ```go
 package main
 import (
-    supa "github.com/nedpals/supabase-go"
+    supa "github.com/semvis123/supabase-go"
     "fmt"
 )
 
@@ -191,7 +191,7 @@ func main() {
 ```go
 package main
 import (
-    supa "github.com/nedpals/supabase-go"
+    supa "github.com/semvis123/supabase-go"
     "fmt"
     "context"
 )
@@ -223,7 +223,7 @@ func main() {
 
 - [x] Auth support (1)
 - [x] DB support (2)
-- [ ] Realtime
+- [x] Realtime
 - [x] Storage
 - [ ] Testing
 
@@ -240,7 +240,7 @@ It tries to mimick as much as possible the official Javascript client library in
 
 ## Submitting a pull request
 
-- Fork it (https://github.com/nedpals/supabase-go/fork)
+- Fork it (https://github.com/semvis123/supabase-go/fork)
 - Create your feature branch (git checkout -b my-new-feature)
 - Commit your changes (git commit -am 'Add some feature')
 - Push to the branch (git push origin my-new-feature)
@@ -248,4 +248,4 @@ It tries to mimick as much as possible the official Javascript client library in
 
 # Contributors
 
-- [nedpals](https://github.com/nedpals) - creator and maintainer
+- [semvis123](https://github.com/semvis123) - creator and maintainer
