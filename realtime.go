@@ -37,15 +37,16 @@ type Realtime struct {
 }
 
 type Channel struct {
-	Topic        string
-	Url          string
-	Origin       string
-	listeners    []Listener
-	ws           *websocket.Conn
-	Connected    bool
-	closeChan    chan struct{}
-	OnDisconnect func(*Channel)
-	OnConnect    func(*Channel)
+	Topic         string
+	Url           string
+	Origin        string
+	listeners     []Listener
+	ws            *websocket.Conn
+	Connected     bool
+	closeChan     chan struct{}
+	reconnectChan chan struct{}
+	OnDisconnect  func(*Channel)
+	OnConnect     func(*Channel)
 }
 
 func newChannel(topic string, url string) *Channel {
@@ -56,6 +57,7 @@ func newChannel(topic string, url string) *Channel {
 		nil,
 		nil,
 		false,
+		make(chan struct{}),
 		make(chan struct{}),
 		func(*Channel) {},
 		func(*Channel) {},
@@ -80,7 +82,7 @@ func (r *Realtime) ChannelWithUrl(topic string, websocketUrl string) *Channel {
 }
 
 func (c *Channel) Listen() error {
-	err := c.Open()
+	err := c.open()
 	if err != nil {
 		return err
 	}
@@ -92,7 +94,7 @@ func (c *Channel) Close() {
 	c.closeChan <- struct{}{}
 }
 
-func (c *Channel) Open() error {
+func (c *Channel) open() error {
 	if c.ws != nil {
 		c.ws.Close()
 	}
@@ -130,6 +132,11 @@ func (c *Channel) handleCallbacks() {
 			continue
 		}
 		if n, err = c.ws.Read(msg); err != nil {
+			c.Connected = false
+			c.ws.Close()
+			c.OnDisconnect(c)
+			c.reconnectChan <- struct{}{}
+
 			continue // ignore errors
 		}
 		message := &Message{}
@@ -164,10 +171,12 @@ func (c *Channel) keepAlive() {
 			c.Connected = false
 			c.ws.Close()
 			c.OnDisconnect(c)
+		case <-c.reconnectChan:
+			_ = c.open()
 		case <-time.After(time.Second * 5):
 			if _, err := c.ws.Write(msgBytes); err != nil {
 				// try reconnecting
-				err = c.Open()
+				err = c.open()
 				if err != nil && c.Connected {
 					// ignore connection errors, and just try again in the next heartbeat
 					c.Connected = false
