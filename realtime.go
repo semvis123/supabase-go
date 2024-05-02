@@ -37,13 +37,29 @@ type Realtime struct {
 }
 
 type Channel struct {
-	Topic     string
-	Url       string
-	Origin    string
-	listeners []Listener
-	ws        *websocket.Conn
-	Connected bool
-	closeChan chan struct{}
+	Topic        string
+	Url          string
+	Origin       string
+	listeners    []Listener
+	ws           *websocket.Conn
+	Connected    bool
+	closeChan    chan struct{}
+	OnDisconnect func(*Channel)
+	OnConnect    func(*Channel)
+}
+
+func newChannel(topic string, url string) *Channel {
+	return &Channel{
+		topic,
+		url,
+		"http://localhost/",
+		nil,
+		nil,
+		false,
+		make(chan struct{}),
+		func(*Channel) {},
+		func(*Channel) {},
+	}
 }
 
 type Listener struct {
@@ -56,11 +72,11 @@ func (r *Realtime) Channel(topic string) *Channel {
 	websocketUrl = strings.Replace(websocketUrl, "https://", "wss://", 1)
 	websocketUrl = strings.Replace(websocketUrl, "http://", "ws://", 1)
 	websocketUrl = fmt.Sprintf("%s/realtime/v1/websocket?apikey=%s&vsn=1.0.0", websocketUrl, r.client.apiKey)
-	return &Channel{topic, websocketUrl, "http://localhost/", nil, nil, false, make(chan struct{})}
+	return newChannel(topic, websocketUrl)
 }
 
 func (r *Realtime) ChannelWithUrl(topic string, websocketUrl string) *Channel {
-	return &Channel{topic, websocketUrl, "http://localhost/", nil, nil, false, make(chan struct{})}
+	return newChannel(topic, websocketUrl)
 }
 
 func (c *Channel) Listen() error {
@@ -97,6 +113,7 @@ func (c *Channel) Open() error {
 	}
 
 	go c.handleCallbacks()
+	c.OnConnect(c)
 	return nil
 }
 
@@ -146,6 +163,7 @@ func (c *Channel) keepAlive() {
 		case <-c.closeChan:
 			c.Connected = false
 			c.ws.Close()
+			c.OnDisconnect(c)
 		case <-time.After(time.Second * 5):
 			if _, err := c.ws.Write(msgBytes); err != nil {
 				// try reconnecting
