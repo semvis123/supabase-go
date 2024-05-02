@@ -168,9 +168,10 @@ func (c *Channel) keepAlive() {
 			if _, err := c.ws.Write(msgBytes); err != nil {
 				// try reconnecting
 				err = c.Open()
-				if err != nil {
+				if err != nil && c.Connected {
 					// ignore connection errors, and just try again in the next heartbeat
 					c.Connected = false
+					c.OnDisconnect(c)
 				}
 			}
 		}
