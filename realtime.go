@@ -55,7 +55,7 @@ func (r *Realtime) Channel(topic string) *Channel {
 	websocketUrl := r.client.BaseURL
 	websocketUrl = strings.Replace(websocketUrl, "https://", "wss://", 1)
 	websocketUrl = strings.Replace(websocketUrl, "http://", "ws://", 1)
-	websocketUrl = fmt.Sprintf("%s/realtime/v1/websocket", websocketUrl)
+	websocketUrl = fmt.Sprintf("%s/realtime/v1/websocket?apikey=%s&vsn=1.0.0", websocketUrl, r.client.apiKey)
 	return &Channel{topic, websocketUrl, "http://localhost/", nil, nil, false, make(chan struct{})}
 }
 
