@@ -133,7 +133,7 @@ func (c *Channel) handleCallbacks() {
 			continue // ignore errors
 		}
 		message := &Message{}
-		if err := json.Unmarshal(msg[n:], message); err != nil {
+		if err := json.Unmarshal(msg[:n], message); err != nil {
 			continue // ignore errors
 		}
 		if message.Event == phxReply {
