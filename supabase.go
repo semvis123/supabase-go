@@ -7,7 +7,7 @@ import (
 	"net/url"
 	"time"
 
-	postgrest "github.com/nedpals/postgrest-go/pkg"
+	postgrest "github.com/supabase-community/postgrest-go"
 )
 
 const (
@@ -42,10 +42,12 @@ func (err *ErrorResponse) Error() string {
 
 // CreateClient creates a new Supabase client
 func CreateClient(baseURL string, supabaseKey string, debug ...bool) *Client {
-	parsedURL, err := url.Parse(fmt.Sprintf("%s/%s/", baseURL, RestEndpoint))
+	urlString := fmt.Sprintf("%s/%s/", baseURL, RestEndpoint)
+	_, err := url.Parse(urlString)
 	if err != nil {
 		panic(err)
 	}
+
 	client := &Client{
 		BaseURL:  baseURL,
 		apiKey:   supabaseKey,
@@ -58,14 +60,11 @@ func CreateClient(baseURL string, supabaseKey string, debug ...bool) *Client {
 			Timeout: time.Minute,
 		},
 		DB: postgrest.NewClient(
-			*parsedURL,
-			postgrest.WithTokenAuth(supabaseKey),
-			func(c *postgrest.Client) {
-				// debug parameter is only for postgrest-go for now
-				if len(debug) > 0 {
-					c.Debug = debug[0]
-				}
-				c.AddHeader("apikey", supabaseKey)
+			urlString,
+			"public",
+			map[string]string{
+				"apikey":        supabaseKey,
+				"Authorization": "Bearer " + supabaseKey,
 			},
 		),
 	}
@@ -79,10 +78,14 @@ func CreateClient(baseURL string, supabaseKey string, debug ...bool) *Client {
 
 // CreateClient creates a new Supabase client
 func CreateClientWithHeaders(baseURL string, supabaseKey string, headers map[string]string, debug ...bool) *Client {
-	parsedURL, err := url.Parse(fmt.Sprintf("%s/%s/", baseURL, RestEndpoint))
+	urlString := fmt.Sprintf("%s/%s/", baseURL, RestEndpoint)
+	_, err := url.Parse(urlString)
 	if err != nil {
 		panic(err)
 	}
+	headers["apikey"] = supabaseKey
+	headers["Authorization"] = "Bearer " + supabaseKey
+
 	client := &Client{
 		BaseURL:  baseURL,
 		apiKey:   supabaseKey,
@@ -95,18 +98,9 @@ func CreateClientWithHeaders(baseURL string, supabaseKey string, headers map[str
 			Timeout: time.Minute,
 		},
 		DB: postgrest.NewClient(
-			*parsedURL,
-			postgrest.WithTokenAuth(supabaseKey),
-			func(c *postgrest.Client) {
-				// debug parameter is only for postgrest-go for now
-				if len(debug) > 0 {
-					c.Debug = debug[0]
-				}
-				c.AddHeader("apikey", supabaseKey)
-				for key, val := range headers {
-					c.AddHeader(key, val)
-				}
-			},
+			urlString,
+			"public",
+			headers,
 		),
 	}
 	client.Admin.client = client
