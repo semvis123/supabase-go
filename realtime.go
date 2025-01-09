@@ -90,6 +90,26 @@ func (c *Channel) Listen() error {
 	return nil
 }
 
+func (c *Channel) Send(event string, payload map[string]interface{}) error {
+	msg := &Message{Topic: c.Topic, Event: event, Payload: payload}
+	msgBytes, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	if !c.Connected {
+		// attempt to reconnect
+		err = c.open()
+		if err != nil {
+			return err
+		}
+	}
+	_, err = c.ws.Write(msgBytes)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func (c *Channel) Close() {
 	c.closeChan <- struct{}{}
 }
