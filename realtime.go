@@ -124,7 +124,12 @@ func (c *Channel) open() error {
 	}
 	c.ws = ws
 	c.Connected = true
-	msg := &Message{Topic: c.Topic, Event: phxJoin}
+	msg := &Message{Topic: c.Topic, Event: phxJoin, Payload: map[string]interface{}{
+		"config": map[string]interface{}{
+			"broadcast": map[string]interface{}{
+				"self": true,
+			},
+		}}}
 	msgBytes, err := json.Marshal(msg)
 	if err != nil {
 		panic("incorrect join message configured")
