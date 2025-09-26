@@ -1,10 +1,12 @@
-github.com/google/go-cmp v0.5.2 h1:X2ev0eStA3AbceY54o37/0PQ/UWqKEiiO2dKL5OPaFM=
 github.com/google/go-cmp v0.5.2/go.mod h1:v8dTdLbMG2kIc/vJvl+f65V22dbkXbowE6jgT/gNBxE=
 github.com/google/go-cmp v0.5.8 h1:e6P7q2lk1O+qJJb4BtCQXlK8vWEO8V1ZeuEdJNOqZyg=
+github.com/google/go-cmp v0.5.8/go.mod h1:17dUlkBOakJ0+DkrSSNjCkIjxS6bF9zb3elmeNGIjoY=
 github.com/google/go-querystring v1.1.0 h1:AnCroh3fv4ZBgVIf1Iwtovgjaw/GiKJo8M8yD/fhyJ8=
 github.com/google/go-querystring v1.1.0/go.mod h1:Kcdr2DB4koayq7X8pmAG4sNG59So17icRSOU623lUBU=
-github.com/semvis123/postgrest-go v0.2.3 h1:zA9DdAoVKgza8OGC0rxDEQgibND5FyJ84Pi4TnvuPZE=
-github.com/semvis123/postgrest-go v0.2.3/go.mod h1:AX6er6UvOW9ZBQ9eUDGFod9GQkhN/yzEazY8HWQpjeA=
+github.com/semvis123/postgrest-go v0.0.12-0.20250926140902-d882bc01de6c h1:s3pbm/C0XGIVsCCG1YKWHAGrPzT91fuy2++HkoyWAno=
+github.com/semvis123/postgrest-go v0.0.12-0.20250926140902-d882bc01de6c/go.mod h1:b9fUn3IDnpakfsJkbhG0xw7H6gAa4UJH++sCGQvUP6M=
+github.com/semvis123/postgrest-go v0.1.4 h1:rvn4pI96uOyoEWNmB6a7GpBPxDqSF23CUXJ7fBdPxd4=
+github.com/semvis123/postgrest-go v0.1.4/go.mod h1:BTx4ODuLwEithkgSphH6gmMLQZqe/YU77GV3OvDQBkU=
 golang.org/x/exp v0.0.0-20240416160154-fe59bbe5cc7f h1:99ci1mjWVBWwJiEKYY6jWa4d2nTQVIEhZIptnrVb1XY=
 golang.org/x/exp v0.0.0-20240416160154-fe59bbe5cc7f/go.mod h1:/lliqkxwWAhPjf5oSOIJup2XcqJaw8RGS6k3TGEc7GI=
 golang.org/x/net v0.24.0 h1:1PcaxkF854Fu3+lvBIx5SYn9wRlBzzcnHZSiaFFAb0w=
