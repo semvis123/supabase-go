@@ -7,7 +7,7 @@ require (
 )
 
 require (
-	github.com/supabase-community/postgrest-go v0.0.11 // indirect
+	github.com/semvis123/postgrest-go v0.2.2
 	golang.org/x/exp v0.0.0-20240416160154-fe59bbe5cc7f // indirect
 	golang.org/x/net v0.24.0 // indirect
 )
