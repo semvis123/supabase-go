@@ -58,6 +58,9 @@ func (s *Storage) CreateBucket(ctx context.Context, option BucketOption) (*bucke
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	for key, val := range s.client.Headers {
+		req.Header.Set(key, val)
+	}
 	injectAuthorizationHeader(req, s.client.apiKey)
 	res := bucket{}
 	errRes := storageError{}
@@ -80,6 +83,9 @@ func (s *Storage) GetBucket(ctx context.Context, id string) (*bucketResponse, er
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	for key, val := range s.client.Headers {
+		req.Header.Set(key, val)
+	}
 	injectAuthorizationHeader(req, s.client.apiKey)
 	res := bucketResponse{}
 	errRes := storageError{}
@@ -101,6 +107,9 @@ func (s *Storage) ListBuckets(ctx context.Context) (*[]bucketResponse, error) {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	for key, val := range s.client.Headers {
+		req.Header.Set(key, val)
+	}
 	injectAuthorizationHeader(req, s.client.apiKey)
 	res := []bucketResponse{}
 	errRes := storageError{}
@@ -123,6 +132,9 @@ func (s *Storage) EmptyBucket(ctx context.Context, id string) (*bucketMessage, e
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	for key, val := range s.client.Headers {
+		req.Header.Set(key, val)
+	}
 	injectAuthorizationHeader(req, s.client.apiKey)
 	res := bucketMessage{}
 	errRes := storageError{}
@@ -146,6 +158,9 @@ func (s *Storage) UpdateBucket(ctx context.Context, id string, option BucketOpti
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	for key, val := range s.client.Headers {
+		req.Header.Set(key, val)
+	}
 	injectAuthorizationHeader(req, s.client.apiKey)
 	res := bucketMessage{}
 	errRes := storageError{}
@@ -166,7 +181,9 @@ func (s *Storage) DeleteBucket(ctx context.Context, id string) (*bucketResponse,
 	if err != nil {
 		return nil, err
 	}
-
+	for key, val := range s.client.Headers {
+		req.Header.Set(key, val)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	injectAuthorizationHeader(req, s.client.apiKey)
 	res := bucketResponse{}
@@ -295,6 +312,9 @@ func (f *file) UploadOrUpdate(path string, data io.Reader, update bool, opts *Fi
 		return FileResponse{}, err
 	}
 
+	for key, val := range f.storage.client.Headers {
+		req.Header.Set(key, val)
+	}
 	injectAuthorizationHeader(req, f.storage.client.apiKey)
 	req.Header.Set("cache-control", mergedOpts.CacheControl)
 	req.Header.Set("content-type", mergedOpts.ContentType)
@@ -345,6 +365,9 @@ func (f *file) Move(fromPath string, toPath string) (FileResponse, error) {
 		return FileResponse{}, err
 	}
 
+	for key, val := range f.storage.client.Headers {
+		req.Header.Set(key, val)
+	}
 	injectAuthorizationHeader(req, f.storage.client.apiKey)
 
 	client := &http.Client{}
@@ -378,6 +401,9 @@ func (f *file) CreatSignedUrl(filePath string, expiresIn int) (SignedUrlResponse
 		return SignedUrlResponse{}, err
 	}
 
+	for key, val := range f.storage.client.Headers {
+		req.Header.Set(key, val)
+	}
 	injectAuthorizationHeader(req, f.storage.client.apiKey)
 
 	client := &http.Client{}
@@ -419,6 +445,9 @@ func (f *file) Remove(filePaths []string) (FileResponse, error) {
 		return FileResponse{}, err
 	}
 
+	for key, val := range f.storage.client.Headers {
+		req.Header.Set(key, val)
+	}
 	injectAuthorizationHeader(req, f.storage.client.apiKey)
 
 	req.Header.Set("Content-Type", "application/json")
@@ -480,6 +509,9 @@ func (f *file) List(queryPath string, options FileSearchOptions) ([]FileObject, 
 		return nil, err
 	}
 
+	for key, val := range f.storage.client.Headers {
+		req.Header.Set(key, val)
+	}
 	injectAuthorizationHeader(req, f.storage.client.apiKey)
 
 	client := &http.Client{}
@@ -515,6 +547,9 @@ func (f *file) Copy(fromPath, toPath string) (FileResponse, error) {
 		return FileResponse{}, err
 	}
 
+	for key, val := range f.storage.client.Headers {
+		req.Header.Set(key, val)
+	}
 	injectAuthorizationHeader(req, f.storage.client.apiKey)
 
 	client := &http.Client{}
@@ -544,6 +579,9 @@ func (f *file) Download(filePath string) ([]byte, error) {
 		return nil, err
 	}
 
+	for key, val := range f.storage.client.Headers {
+		req.Header.Set(key, val)
+	}
 	injectAuthorizationHeader(req, f.storage.client.apiKey)
 
 	client := &http.Client{}
