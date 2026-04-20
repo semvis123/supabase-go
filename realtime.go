@@ -2,8 +2,12 @@ package supabase
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/exp/slices"
@@ -19,7 +23,13 @@ const (
 	phxHeartbeat    = "heartbeat"
 	phxTopic        = "phoenix"
 	maxMessageBytes = 3_072_000
+
+	dialTimeout         = 10 * time.Second
+	initialReconnectGap = 500 * time.Millisecond
+	maxReconnectGap     = 30 * time.Second
 )
+
+var errChannelClosed = errors.New("channel is closed")
 
 var (
 	phxHeartbeatPayload = map[string]interface{}{"msg": "heartbeat"}
@@ -43,24 +53,24 @@ type Channel struct {
 	listeners     []Listener
 	ws            *websocket.Conn
 	Connected     bool
+	closed        atomic.Bool
+	closeOnce     sync.Once
 	closeChan     chan struct{}
 	reconnectChan chan struct{}
+	keepAliveWG   sync.WaitGroup
 	OnDisconnect  func(*Channel)
 	OnConnect     func(*Channel)
 }
 
 func newChannel(topic string, url string) *Channel {
 	return &Channel{
-		topic,
-		url,
-		"http://localhost/",
-		nil,
-		nil,
-		false,
-		make(chan struct{}),
-		make(chan struct{}, 1),
-		func(*Channel) {},
-		func(*Channel) {},
+		Topic:         topic,
+		Url:           url,
+		Origin:        "http://localhost/",
+		closeChan:     make(chan struct{}),
+		reconnectChan: make(chan struct{}, 1),
+		OnDisconnect:  func(*Channel) {},
+		OnConnect:     func(*Channel) {},
 	}
 }
 
@@ -86,11 +96,18 @@ func (c *Channel) Listen() error {
 	if err != nil {
 		return err
 	}
-	go c.keepAlive()
+	c.keepAliveWG.Add(1)
+	go func() {
+		defer c.keepAliveWG.Done()
+		c.keepAlive()
+	}()
 	return nil
 }
 
 func (c *Channel) Send(event string, payload map[string]interface{}) error {
+	if c.closed.Load() {
+		return errChannelClosed
+	}
 	msg := &Message{Topic: c.Topic, Event: event, Payload: payload}
 	msgBytes, err := json.Marshal(msg)
 	if err != nil {
@@ -110,12 +127,28 @@ func (c *Channel) Send(event string, payload map[string]interface{}) error {
 	return nil
 }
 
+// Close terminates the channel. Subsequent reconnect signals are ignored,
+// keepAlive exits, and further Send calls return errChannelClosed. Safe to
+// call more than once. Blocks until keepAlive has finished cleanup, so on
+// return c.Connected is guaranteed to be false and c.ws is closed.
 func (c *Channel) Close() {
-	c.closeChan <- struct{}{}
+	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		close(c.closeChan)
+	})
+	c.keepAliveWG.Wait()
 }
 
 func (c *Channel) open() error {
-	newWs, err := websocket.Dial(c.Url, "", c.Origin)
+	if c.closed.Load() {
+		return errChannelClosed
+	}
+	cfg, err := websocket.NewConfig(c.Url, c.Origin)
+	if err != nil {
+		return err
+	}
+	cfg.Dialer = &net.Dialer{Timeout: dialTimeout}
+	newWs, err := websocket.DialConfig(cfg)
 	if err != nil {
 		return err
 	}
@@ -133,6 +166,14 @@ func (c *Channel) open() error {
 	if _, err := newWs.Write(msgBytes); err != nil {
 		newWs.Close()
 		return err
+	}
+
+	// Close may have been called while we were dialing. Don't install the
+	// new connection in that case — leave Connected false and let Close's
+	// cleanup proceed.
+	if c.closed.Load() {
+		newWs.Close()
+		return errChannelClosed
 	}
 
 	// Swap the new connection into place before closing the old one. The old
@@ -178,10 +219,10 @@ func (c *Channel) handleCallbacks(ws *websocket.Conn) {
 
 	ws.Close()
 
-	// If open() has already swapped in a new connection, the new reader owns
-	// the disconnect/reconnect transition — exit silently so we don't fire
-	// spurious OnDisconnect events or kick off a second reconnect.
-	if c.ws != ws {
+	// Silent exit if:
+	//  - open() has already replaced c.ws (new reader owns this connection), or
+	//  - the channel was closed by the user (keepAlive will fire OnDisconnect).
+	if c.ws != ws || c.closed.Load() {
 		return
 	}
 	c.Connected = false
@@ -203,26 +244,62 @@ func (c *Channel) keepAlive() {
 	if err != nil {
 		panic("incorrect heartbeat msg configured")
 	}
+
+	// On shutdown, close the current ws and fire a final OnDisconnect — but
+	// only if the channel was believed to be connected at close time.
+	defer func() {
+		c.closed.Store(true)
+		wasConnected := c.Connected
+		c.Connected = false
+		if c.ws != nil {
+			c.ws.Close()
+		}
+		if wasConnected {
+			c.OnDisconnect(c)
+		}
+	}()
+
+	gap := initialReconnectGap
 	for {
 		select {
 		case <-c.closeChan:
-			c.Connected = false
-			c.ws.Close()
-			c.OnDisconnect(c)
+			return
 		case <-c.reconnectChan:
-			_ = c.open()
+			if !c.reconnectWithBackoff(&gap) {
+				return
+			}
 		case <-time.After(time.Second * 5):
+			if !c.Connected || c.ws == nil {
+				continue
+			}
 			if _, err := c.ws.Write(msgBytes); err != nil {
-				// try reconnecting
-				err = c.open()
-				if err != nil && c.Connected {
-					// ignore connection errors, and just try again in the next heartbeat
-					c.Connected = false
-					c.OnDisconnect(c)
+				if !c.reconnectWithBackoff(&gap) {
+					return
 				}
 			}
 		}
+	}
+}
 
+// reconnectWithBackoff retries open() with exponential backoff until it
+// succeeds or the channel is closed. Returns false if closed.
+func (c *Channel) reconnectWithBackoff(gap *time.Duration) bool {
+	for {
+		select {
+		case <-c.closeChan:
+			return false
+		default:
+		}
+		if err := c.open(); err == nil {
+			*gap = initialReconnectGap
+			return true
+		}
+		select {
+		case <-c.closeChan:
+			return false
+		case <-time.After(*gap):
+		}
+		*gap = min(*gap*2, maxReconnectGap)
 	}
 }
 

@@ -1,6 +1,7 @@
 package supabase
 
 import (
+	"errors"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
@@ -132,5 +133,80 @@ func TestChannelReconnectOneForOne(t *testing.T) {
 	}
 	if cc < ac-2 {
 		t.Errorf("connects=%d much less than accepts=%d", cc, ac)
+	}
+}
+
+// TestCloseStaysClosed verifies that Close() terminates keepAlive and prevents
+// further reconnect attempts. Pre-fix, the reader's error handler fired
+// OnDisconnect + reconnectChan after Close, causing the channel to reconnect
+// after the user had asked it to stop.
+func TestCloseStaysClosed(t *testing.T) {
+	var accepts atomic.Int64
+
+	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		accepts.Add(1)
+		buf := make([]byte, 4096)
+		_ = ws.SetReadDeadline(time.Now().Add(time.Second))
+		_, _ = ws.Read(buf)
+		ws.Close()
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ch := newChannel("topic", wsURL)
+
+	var disconnects atomic.Int64
+	ch.OnDisconnect = func(*Channel) { disconnects.Add(1) }
+
+	if err := ch.Listen(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for a couple of connect/disconnect cycles so we're exercising the
+	// reconnect loop at the time Close is called.
+	for i := 0; i < 200 && accepts.Load() < 3; i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if accepts.Load() < 2 {
+		t.Fatalf("need >= 2 accepts before Close, got %d", accepts.Load())
+	}
+
+	acceptsAtClose := accepts.Load()
+	disconnectsAtClose := disconnects.Load()
+
+	ch.Close()
+
+	// Idempotency: second Close must not panic / block.
+	done := make(chan struct{})
+	go func() { ch.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("second Close() blocked; not idempotent")
+	}
+
+	// After Close, Send must reject.
+	if err := ch.Send("x", map[string]interface{}{"k": "v"}); !errors.Is(err, errChannelClosed) {
+		t.Errorf("Send after Close: got err=%v; want errChannelClosed", err)
+	}
+
+	// Give the system time to (incorrectly) reconnect. Without the fix, the
+	// reader's error handler would have signaled reconnectChan and keepAlive
+	// would have opened a fresh connection.
+	time.Sleep(800 * time.Millisecond)
+
+	extraAccepts := accepts.Load() - acceptsAtClose
+	if extraAccepts > 1 {
+		t.Errorf("reconnected after Close: %d extra server accepts", extraAccepts)
+	}
+
+	// At most one final OnDisconnect (fired by keepAlive's defer) after Close.
+	extraDisconnects := disconnects.Load() - disconnectsAtClose
+	if extraDisconnects > 1 {
+		t.Errorf("got %d OnDisconnect calls after Close; want at most 1", extraDisconnects)
+	}
+
+	if ch.Connected {
+		t.Error("Connected is still true after Close")
 	}
 }
