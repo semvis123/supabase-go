@@ -58,7 +58,7 @@ func newChannel(topic string, url string) *Channel {
 		nil,
 		false,
 		make(chan struct{}),
-		make(chan struct{}),
+		make(chan struct{}, 1),
 		func(*Channel) {},
 		func(*Channel) {},
 	}
@@ -115,15 +115,10 @@ func (c *Channel) Close() {
 }
 
 func (c *Channel) open() error {
-	if c.ws != nil {
-		c.ws.Close()
-	}
-	ws, err := websocket.Dial(c.Url, "", c.Origin)
+	newWs, err := websocket.Dial(c.Url, "", c.Origin)
 	if err != nil {
 		return err
 	}
-	c.ws = ws
-	c.Connected = true
 	msg := &Message{Topic: c.Topic, Event: phxJoin, Payload: map[string]interface{}{
 		"config": map[string]interface{}{
 			"broadcast": map[string]interface{}{
@@ -132,37 +127,40 @@ func (c *Channel) open() error {
 		}}}
 	msgBytes, err := json.Marshal(msg)
 	if err != nil {
+		newWs.Close()
 		panic("incorrect join message configured")
 	}
-	_, err = c.ws.Write(msgBytes)
-	if err != nil {
+	if _, err := newWs.Write(msgBytes); err != nil {
+		newWs.Close()
 		return err
 	}
 
-	go c.handleCallbacks()
+	// Swap the new connection into place before closing the old one. The old
+	// reader goroutine checks c.ws == its local ws and will exit silently
+	// instead of treating the imminent close as a disconnect.
+	oldWs := c.ws
+	c.ws = newWs
+	c.Connected = true
+	if oldWs != nil {
+		oldWs.Close()
+	}
+
+	go c.handleCallbacks(newWs)
 	c.OnConnect(c)
 	return nil
 }
 
-func (c *Channel) handleCallbacks() {
+func (c *Channel) handleCallbacks(ws *websocket.Conn) {
 	var msg = make([]byte, maxMessageBytes)
 	var n int
 
 	for {
-		if !c.Connected {
+		if err := ws.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 			break
 		}
-		err := c.ws.SetReadDeadline(time.Now().Add(10 * time.Second))
-		if err != nil {
-			continue
-		}
-		if n, err = c.ws.Read(msg); err != nil {
-			c.Connected = false
-			c.ws.Close()
-			c.OnDisconnect(c)
-			c.reconnectChan <- struct{}{}
-
-			continue // ignore errors
+		var err error
+		if n, err = ws.Read(msg); err != nil {
+			break
 		}
 		message := &Message{}
 		if err := json.Unmarshal(msg[:n], message); err != nil {
@@ -176,6 +174,21 @@ func (c *Channel) handleCallbacks() {
 				l.callback(c, message)
 			}
 		}
+	}
+
+	ws.Close()
+
+	// If open() has already swapped in a new connection, the new reader owns
+	// the disconnect/reconnect transition — exit silently so we don't fire
+	// spurious OnDisconnect events or kick off a second reconnect.
+	if c.ws != ws {
+		return
+	}
+	c.Connected = false
+	c.OnDisconnect(c)
+	select {
+	case c.reconnectChan <- struct{}{}:
+	default:
 	}
 }
 
