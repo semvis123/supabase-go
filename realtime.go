@@ -25,11 +25,15 @@ const (
 	maxMessageBytes = 3_072_000
 
 	dialTimeout         = 10 * time.Second
+	writeTimeout        = 10 * time.Second
 	initialReconnectGap = 500 * time.Millisecond
 	maxReconnectGap     = 30 * time.Second
 )
 
-var errChannelClosed = errors.New("channel is closed")
+var (
+	errChannelClosed         = errors.New("channel is closed")
+	errChannelAlreadyStarted = errors.New("Listen already called on this channel")
+)
 
 var (
 	phxHeartbeatPayload = map[string]interface{}{"msg": "heartbeat"}
@@ -46,13 +50,40 @@ type Realtime struct {
 	client *Client
 }
 
+// Channel represents a realtime channel.
+//
+// All exported fields (Topic, Url, Origin, OnConnect, OnDisconnect) must
+// be set before Listen() or the first Send() and treated as read-only
+// after; they are read from internal goroutines without synchronization.
+//
+// OnConnect and OnDisconnect are invoked from internal goroutines, so they
+// may call Close() without deadlocking. They are not serialized with each
+// other — a slow OnConnect can overlap with the next OnDisconnect, and in
+// rare races (Close() arriving just as a connect goroutine is being
+// launched) you may observe an OnDisconnect with no preceding OnConnect.
+// Listener callbacks registered with On(...) run synchronously on the read
+// goroutine and MUST NOT call Close().
 type Channel struct {
-	Topic         string
-	Url           string
-	Origin        string
-	listeners     []Listener
-	ws            *websocket.Conn
-	Connected     bool
+	Topic     string
+	Url       string
+	Origin    string
+	listeners []Listener
+
+	mu        sync.Mutex // protects ws, connected, listeners
+	ws        *websocket.Conn
+	connected bool
+
+	// openMu serializes open() so concurrent callers don't each create a
+	// fresh dial+OnConnect cycle for the same logical connect.
+	openMu sync.Mutex
+	// writeMu serializes the SetWriteDeadline+Write pair on c.ws so concurrent
+	// writers (Send and the heartbeat) can't clobber each other's deadline,
+	// and is held by anyone closing c.ws so a Send/heartbeat write cannot
+	// land on a connection that is being torn down. Frame integrity itself
+	// is provided by the underlying websocket library.
+	writeMu sync.Mutex
+
+	started       atomic.Bool // guards repeated Listen() calls
 	closed        atomic.Bool
 	closeOnce     sync.Once
 	closeChan     chan struct{}
@@ -91,12 +122,37 @@ func (r *Realtime) ChannelWithUrl(topic string, websocketUrl string) *Channel {
 	return newChannel(topic, websocketUrl)
 }
 
+// Listen connects the channel and starts the keepAlive loop. It must be
+// called at most once per channel; calling it twice would spawn two
+// keepAlive goroutines, doubling heartbeats and racing on shutdown. If
+// Listen returns an error, the channel can be retried (started is reset).
 func (c *Channel) Listen() error {
-	err := c.open()
-	if err != nil {
+	// Hold c.mu across the closed-check and WG.Add so a concurrent Close()
+	// either observes !closed here (and the Add) before its own closed.Store
+	// + Wait, or observes closed first and we bail early. Without this
+	// ordering, Close()'s Wait could land on a zero counter just before
+	// Listen's Add(1), which is a sync.WaitGroup misuse.
+	c.mu.Lock()
+	if c.closed.Load() {
+		c.mu.Unlock()
+		return errChannelClosed
+	}
+	if !c.started.CompareAndSwap(false, true) {
+		c.mu.Unlock()
+		return errChannelAlreadyStarted
+	}
+	// Add to the WaitGroup before open() so that any goroutine open()
+	// spawns (handleCallbacks, OnConnect) that ends up calling Close()
+	// observes a non-zero counter and waits for keepAlive to finish.
+	c.keepAliveWG.Add(1)
+	c.mu.Unlock()
+	if err := c.open(); err != nil {
+		// Reset started before Done so a concurrent Listen() doesn't observe
+		// started=true on a channel we've effectively given up on.
+		c.started.Store(false)
+		c.keepAliveWG.Done()
 		return err
 	}
-	c.keepAliveWG.Add(1)
 	go func() {
 		defer c.keepAliveWG.Done()
 		c.keepAlive()
@@ -104,6 +160,9 @@ func (c *Channel) Listen() error {
 	return nil
 }
 
+// Send transmits an event, opening the connection on first use. Without a
+// prior Listen() the channel does not auto-reconnect: a dropped connection
+// is reopened lazily on the next Send().
 func (c *Channel) Send(event string, payload map[string]interface{}) error {
 	if c.closed.Load() {
 		return errChannelClosed
@@ -113,45 +172,137 @@ func (c *Channel) Send(event string, payload map[string]interface{}) error {
 	if err != nil {
 		return err
 	}
-	if !c.Connected {
-		// attempt to reconnect
-		err = c.open()
-		if err != nil {
+
+	c.mu.Lock()
+	connected := c.connected
+	c.mu.Unlock()
+	if !connected {
+		if err := c.open(); err != nil {
 			return err
 		}
 	}
-	_, err = c.ws.Write(msgBytes)
-	if err != nil {
+
+	// Re-snapshot ws under writeMu so we cannot pick up a connection that
+	// open() is about to swap out (open() also takes writeMu around the
+	// swap+close-oldWs).
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.closed.Load() {
+		return errChannelClosed
+	}
+	c.mu.Lock()
+	ws := c.ws
+	c.mu.Unlock()
+	if ws == nil {
+		return errChannelClosed
+	}
+	if err := ws.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		c.markBrokenLocked(ws)
+		return err
+	}
+	if _, err := ws.Write(msgBytes); err != nil {
+		c.markBrokenLocked(ws)
 		return err
 	}
 	return nil
 }
 
+// markBrokenLocked marks the current connection as dead and closes ws so
+// IsConnected/the next Send don't keep lying until handleCallbacks's read
+// deadline catches up. Caller must hold writeMu; ws.Close is idempotent and
+// will also wake the reader, which runs the rest of the disconnect path.
+func (c *Channel) markBrokenLocked(ws *websocket.Conn) {
+	c.mu.Lock()
+	if c.ws == ws {
+		c.connected = false
+	}
+	c.mu.Unlock()
+	ws.Close()
+}
+
+// IsConnected reports whether the channel currently believes it has an open
+// websocket. It is a snapshot — by the time the caller acts on it, the channel
+// may have disconnected.
+func (c *Channel) IsConnected() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.connected
+}
+
 // Close terminates the channel. Subsequent reconnect signals are ignored,
-// keepAlive exits, and further Send calls return errChannelClosed. Safe to
-// call more than once. Blocks until keepAlive has finished cleanup, so on
-// return c.Connected is guaranteed to be false and c.ws is closed.
+// keepAlive (if running) exits, the websocket is closed, and further Send
+// calls return errChannelClosed. Safe to call more than once. On return
+// c.connected is false and c.ws is closed regardless of whether Listen()
+// was called.
+//
+// Close does not wait for the read goroutine or for OnConnect/OnDisconnect
+// callback goroutines, which is what makes it safe to call from those
+// callbacks.
 func (c *Channel) Close() {
 	c.closeOnce.Do(func() {
+		// Set closed under c.mu to pair with Listen()'s WG.Add: if Listen
+		// has already taken the lock and added, we observe the Add before
+		// Wait; otherwise Listen sees closed and bails without Add.
+		c.mu.Lock()
 		c.closed.Store(true)
+		c.mu.Unlock()
 		close(c.closeChan)
+		c.shutdownConn()
 	})
 	c.keepAliveWG.Wait()
+}
+
+// shutdownConn closes c.ws and fires OnDisconnect if the channel was
+// connected. Invoked from Close so cleanup runs even without Listen().
+func (c *Channel) shutdownConn() {
+	c.writeMu.Lock()
+	c.mu.Lock()
+	wasConnected := c.connected
+	c.connected = false
+	ws := c.ws
+	c.mu.Unlock()
+	if ws != nil {
+		ws.Close()
+	}
+	c.writeMu.Unlock()
+	if wasConnected {
+		// Async to keep Close() callable from inside OnDisconnect.
+		go c.fireOnDisconnect()
+	}
 }
 
 func (c *Channel) open() error {
 	if c.closed.Load() {
 		return errChannelClosed
 	}
+	c.openMu.Lock()
+	defer c.openMu.Unlock()
+
+	if c.closed.Load() {
+		return errChannelClosed
+	}
+	// Short-circuit if another goroutine just connected. Without this, two
+	// concurrent open() callers (Send vs reconnect) each dial, each fire
+	// OnConnect, but only one OnDisconnect ever fires for the loser — leaving
+	// connect/disconnect counts permanently out of balance.
+	c.mu.Lock()
+	if c.connected {
+		c.mu.Unlock()
+		return nil
+	}
+	c.mu.Unlock()
+
 	cfg, err := websocket.NewConfig(c.Url, c.Origin)
 	if err != nil {
 		return err
 	}
 	cfg.Dialer = &net.Dialer{Timeout: dialTimeout}
-	newWs, err := websocket.DialConfig(cfg)
+
+	newWs, err := c.dial(cfg)
 	if err != nil {
 		return err
 	}
+
 	msg := &Message{Topic: c.Topic, Event: phxJoin, Payload: map[string]interface{}{
 		"config": map[string]interface{}{
 			"broadcast": map[string]interface{}{
@@ -163,45 +314,111 @@ func (c *Channel) open() error {
 		newWs.Close()
 		panic("incorrect join message configured")
 	}
+	if err := newWs.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		newWs.Close()
+		return err
+	}
 	if _, err := newWs.Write(msgBytes); err != nil {
 		newWs.Close()
 		return err
 	}
 
-	// Close may have been called while we were dialing. Don't install the
-	// new connection in that case — leave Connected false and let Close's
-	// cleanup proceed.
+	// Install the new connection under mu. Concurrent open() calls are
+	// already serialized by openMu, but writeMu is also taken here so that
+	// any in-flight Send/heartbeat completes before we close oldWs — this
+	// prevents a write from landing on a connection that is being torn down
+	// out from under it.
+	c.writeMu.Lock()
+	c.mu.Lock()
 	if c.closed.Load() {
+		c.mu.Unlock()
+		c.writeMu.Unlock()
 		newWs.Close()
 		return errChannelClosed
 	}
-
-	// Swap the new connection into place before closing the old one. The old
-	// reader goroutine checks c.ws == its local ws and will exit silently
-	// instead of treating the imminent close as a disconnect.
 	oldWs := c.ws
 	c.ws = newWs
-	c.Connected = true
+	c.connected = true
+	c.mu.Unlock()
+
 	if oldWs != nil {
 		oldWs.Close()
 	}
+	c.writeMu.Unlock()
 
 	go c.handleCallbacks(newWs)
-	c.OnConnect(c)
+	// Fire OnConnect from a separate goroutine so user code may safely call
+	// Close() from inside it without deadlocking on keepAliveWG. Skip it if
+	// Close() has already raced in — firing OnConnect for a channel the
+	// user has just closed is misleading. A late race (Close arrives after
+	// this check) is still possible; see Channel doc.
+	if !c.closed.Load() {
+		go c.fireOnConnect()
+	}
 	return nil
 }
 
-func (c *Channel) handleCallbacks(ws *websocket.Conn) {
-	var msg = make([]byte, maxMessageBytes)
-	var n int
+// dial wraps websocket.DialConfig with cancellation on closeChan, so Close()
+// doesn't sit through a 10s dialTimeout. The dial goroutine is drained in the
+// background to avoid leaking the resulting socket.
+func (c *Channel) dial(cfg *websocket.Config) (*websocket.Conn, error) {
+	type result struct {
+		ws  *websocket.Conn
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		ws, err := websocket.DialConfig(cfg)
+		ch <- result{ws, err}
+	}()
+	select {
+	case <-c.closeChan:
+		go func() {
+			r := <-ch
+			if r.ws != nil {
+				r.ws.Close()
+			}
+		}()
+		return nil, errChannelClosed
+	case r := <-ch:
+		return r.ws, r.err
+	}
+}
 
+func (c *Channel) handleCallbacks(ws *websocket.Conn) {
+	// Tear down under writeMu so an in-flight Send/heartbeat completes
+	// before the socket closes. Silent exit if c.ws was already replaced
+	// or the channel was closed by the user. Runs in defer so a panicking
+	// listener doesn't leak the socket and stall reconnect.
+	defer func() {
+		c.writeMu.Lock()
+		c.mu.Lock()
+		isCurrent := c.ws == ws && !c.closed.Load()
+		if isCurrent {
+			c.connected = false
+		}
+		c.mu.Unlock()
+		ws.Close()
+		c.writeMu.Unlock()
+
+		if !isCurrent {
+			return
+		}
+		go c.fireOnDisconnect()
+		select {
+		case c.reconnectChan <- struct{}{}:
+		default:
+		}
+	}()
+
+	msg := make([]byte, maxMessageBytes)
 	for {
 		if err := ws.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-			break
+			return
 		}
-		var err error
-		if n, err = ws.Read(msg); err != nil {
-			break
+		n, err := ws.Read(msg)
+		if err != nil {
+			return
 		}
 		message := &Message{}
 		if err := json.Unmarshal(msg[:n], message); err != nil {
@@ -210,27 +427,38 @@ func (c *Channel) handleCallbacks(ws *websocket.Conn) {
 		if message.Event == phxReply {
 			continue
 		}
-		for _, l := range c.listeners {
+		c.mu.Lock()
+		listeners := append([]Listener(nil), c.listeners...)
+		c.mu.Unlock()
+		for _, l := range listeners {
 			if l.EventName == message.Event || l.EventName == "*" {
-				l.callback(c, message)
+				c.invokeListener(l, message)
 			}
 		}
 	}
+}
 
-	ws.Close()
+// invokeListener calls a user listener with a panic guard so a faulty
+// callback doesn't tear down the read goroutine (and the whole program
+// via unrecovered-panic) and doesn't skip subsequent listeners on the
+// same message.
+func (c *Channel) invokeListener(l Listener, message *Message) {
+	defer func() { _ = recover() }()
+	l.callback(c, message)
+}
 
-	// Silent exit if:
-	//  - open() has already replaced c.ws (new reader owns this connection), or
-	//  - the channel was closed by the user (keepAlive will fire OnDisconnect).
-	if c.ws != ws || c.closed.Load() {
-		return
-	}
-	c.Connected = false
+// fireOnConnect/fireOnDisconnect invoke the lifecycle callbacks with a
+// panic guard. They run in their own goroutines so user code is free to
+// call Close() from inside, and a panic there must not take down the
+// process.
+func (c *Channel) fireOnConnect() {
+	defer func() { _ = recover() }()
+	c.OnConnect(c)
+}
+
+func (c *Channel) fireOnDisconnect() {
+	defer func() { _ = recover() }()
 	c.OnDisconnect(c)
-	select {
-	case c.reconnectChan <- struct{}{}:
-	default:
-	}
 }
 
 func (c *Channel) keepAlive() {
@@ -245,21 +473,9 @@ func (c *Channel) keepAlive() {
 		panic("incorrect heartbeat msg configured")
 	}
 
-	// On shutdown, close the current ws and fire a final OnDisconnect — but
-	// only if the channel was believed to be connected at close time.
-	defer func() {
-		c.closed.Store(true)
-		wasConnected := c.Connected
-		c.Connected = false
-		if c.ws != nil {
-			c.ws.Close()
-		}
-		if wasConnected {
-			c.OnDisconnect(c)
-		}
-	}()
-
 	gap := initialReconnectGap
+	heartbeat := time.NewTicker(5 * time.Second)
+	defer heartbeat.Stop()
 	for {
 		select {
 		case <-c.closeChan:
@@ -268,11 +484,28 @@ func (c *Channel) keepAlive() {
 			if !c.reconnectWithBackoff(&gap) {
 				return
 			}
-		case <-time.After(time.Second * 5):
-			if !c.Connected || c.ws == nil {
-				continue
-			}
-			if _, err := c.ws.Write(msgBytes); err != nil {
+		case <-heartbeat.C:
+			writeErr := func() error {
+				c.writeMu.Lock()
+				defer c.writeMu.Unlock()
+				c.mu.Lock()
+				connected := c.connected
+				ws := c.ws
+				c.mu.Unlock()
+				if !connected || ws == nil {
+					return nil
+				}
+				if err := ws.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+					c.markBrokenLocked(ws)
+					return err
+				}
+				if _, err := ws.Write(msgBytes); err != nil {
+					c.markBrokenLocked(ws)
+					return err
+				}
+				return nil
+			}()
+			if writeErr != nil {
 				if !c.reconnectWithBackoff(&gap) {
 					return
 				}
@@ -304,11 +537,15 @@ func (c *Channel) reconnectWithBackoff(gap *time.Duration) bool {
 }
 
 func (c *Channel) On(event string, callback func(*Channel, *Message)) {
+	c.mu.Lock()
 	c.listeners = append(c.listeners, Listener{event, callback})
+	c.mu.Unlock()
 }
 
 func (c *Channel) RemoveCallbacksForEvent(event string) {
+	c.mu.Lock()
 	c.listeners = slices.DeleteFunc(c.listeners, func(l Listener) bool {
 		return l.EventName == event
 	})
+	c.mu.Unlock()
 }

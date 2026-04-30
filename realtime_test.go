@@ -1,9 +1,11 @@
 package supabase
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,16 +13,12 @@ import (
 	"golang.org/x/net/websocket"
 )
 
-// TestStaleReaderDoesNotKillNewConnection is a regression test for the
-// reconnect-loop bug where an old reader goroutine closed c.ws after open()
-// had already replaced it with a fresh connection, killing the new socket
-// and starting a feedback loop that reconnected ~50 times per second.
-//
-// The fix: open() swaps c.ws before closing the old connection, and
-// handleCallbacks only fires OnDisconnect / reconnect if c.ws is still the
-// ws the goroutine was spawned for.
-func TestStaleReaderDoesNotKillNewConnection(t *testing.T) {
-	// Long-lived server: reads until the client closes.
+// TestOpenWhileConnectedIsNoop verifies that calling open() while the channel
+// is already connected does not create a second socket and does not fire
+// OnConnect again. The pre-fix behavior re-dialed unconditionally, leaving a
+// stale reader to clobber the new connection and producing a runaway
+// connect/disconnect storm.
+func TestOpenWhileConnectedIsNoop(t *testing.T) {
 	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
 		buf := make([]byte, 4096)
 		for {
@@ -42,44 +40,40 @@ func TestStaleReaderDoesNotKillNewConnection(t *testing.T) {
 	if err := ch.open(); err != nil {
 		t.Fatalf("first open: %v", err)
 	}
+	ch.mu.Lock()
 	firstWs := ch.ws
+	ch.mu.Unlock()
 
-	// Give the first reader goroutine time to start and block in Read.
 	time.Sleep(100 * time.Millisecond)
 
 	if err := ch.open(); err != nil {
 		t.Fatalf("second open: %v", err)
 	}
+	ch.mu.Lock()
 	secondWs := ch.ws
+	ch.mu.Unlock()
 
-	if firstWs == secondWs {
-		t.Fatal("second open() did not create a new ws")
+	if firstWs != secondWs {
+		t.Fatal("second open() replaced ws while still connected; should have been a no-op")
 	}
 
-	// Let the stale reader observe the old ws closing and exit.
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
-	if got := connects.Load(); got != 2 {
-		t.Errorf("OnConnect count = %d; want 2", got)
+	if got := connects.Load(); got != 1 {
+		t.Errorf("OnConnect count = %d; want 1 (second open is a no-op)", got)
 	}
 	if got := disconnects.Load(); got != 0 {
-		t.Errorf("stale reader fired OnDisconnect %d times; want 0 "+
-			"(the old goroutine must not treat the already-replaced ws as its own)", got)
+		t.Errorf("OnDisconnect count = %d; want 0", got)
 	}
-	if !ch.Connected {
-		t.Error("channel marked disconnected; stale reader clobbered c.Connected")
-	}
-	if ch.ws != secondWs {
-		t.Error("c.ws changed after second open(); stale reader triggered a spurious reconnect")
+	if !ch.IsConnected() {
+		t.Error("channel marked disconnected after redundant open()")
 	}
 
-	// The new connection should still be usable. If the stale reader had
-	// called c.ws.Close() (the pre-fix behavior), this Write would fail.
-	if _, err := ch.ws.Write([]byte(`{"event":"ping","topic":"topic","payload":{}}`)); err != nil {
-		t.Errorf("write on supposedly-healthy new connection failed: %v", err)
+	if _, err := firstWs.Write([]byte(`{"event":"ping","topic":"topic","payload":{}}`)); err != nil {
+		t.Errorf("write on healthy connection failed: %v", err)
 	}
 
-	ch.ws.Close()
+	ch.Close()
 }
 
 // TestChannelReconnectOneForOne verifies that repeated server-side
@@ -206,7 +200,398 @@ func TestCloseStaysClosed(t *testing.T) {
 		t.Errorf("got %d OnDisconnect calls after Close; want at most 1", extraDisconnects)
 	}
 
-	if ch.Connected {
+	if ch.IsConnected() {
 		t.Error("Connected is still true after Close")
+	}
+}
+
+// TestCloseFromOnDisconnect verifies that calling Close() from inside the
+// OnDisconnect callback does not deadlock. Pre-fix, OnDisconnect ran on the
+// keepAlive goroutine and Close()'s keepAliveWG.Wait() blocked on that same
+// goroutine forever.
+func TestCloseFromOnDisconnect(t *testing.T) {
+	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		buf := make([]byte, 4096)
+		_ = ws.SetReadDeadline(time.Now().Add(time.Second))
+		_, _ = ws.Read(buf)
+		ws.Close()
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ch := newChannel("topic", wsURL)
+
+	closed := make(chan struct{})
+	ch.OnDisconnect = func(c *Channel) {
+		c.Close()
+		close(closed)
+	}
+
+	if err := ch.Listen(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close() from inside OnDisconnect deadlocked")
+	}
+}
+
+// TestConcurrentSendNoFrameCorruption fires many Send() calls concurrently.
+// Without write serialization, the SetWriteDeadline+Write pairs in Send (and
+// the heartbeat path in keepAlive) interleave, corrupting WebSocket frames on
+// the wire. The server validates each frame as JSON; corruption shows up as
+// parse failures or as the server's read loop erroring out before all
+// messages arrive.
+func TestConcurrentSendNoFrameCorruption(t *testing.T) {
+	var received atomic.Int64
+	var parseFailures atomic.Int64
+
+	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		for {
+			_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+			var raw []byte
+			if err := websocket.Message.Receive(ws, &raw); err != nil {
+				return
+			}
+			var msg map[string]interface{}
+			if err := json.Unmarshal(raw, &msg); err != nil {
+				parseFailures.Add(1)
+				continue
+			}
+			received.Add(1)
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ch := newChannel("topic", wsURL)
+	if err := ch.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	defer ch.Close()
+
+	const senders = 20
+	const perSender = 50
+	var wg sync.WaitGroup
+	var sendErrs atomic.Int64
+	for i := 0; i < senders; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perSender; j++ {
+				if err := ch.Send("test", map[string]interface{}{"k": "v"}); err != nil {
+					sendErrs.Add(1)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	expected := int64(senders * perSender)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && received.Load() < expected+1 {
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if pf := parseFailures.Load(); pf > 0 {
+		t.Errorf("server saw %d parse failures (frame corruption)", pf)
+	}
+	if se := sendErrs.Load(); se > 0 {
+		t.Errorf("Send returned %d errors (connection broke during concurrent writes)", se)
+	}
+	if got := received.Load(); got < expected+1 {
+		t.Errorf("server received %d messages; want >= %d (join + %d sends)",
+			got, expected+1, expected)
+	}
+}
+
+// TestConcurrentListenerMutationRace exercises the data race between
+// On()/RemoveCallbacksForEvent (which mutate c.listeners) and the read
+// goroutine in handleCallbacks (which iterates c.listeners). Run under
+// -race; without locking on listeners, the detector fires.
+func TestConcurrentListenerMutationRace(t *testing.T) {
+	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		// Read the join, then push events back to the client at high frequency
+		// so the read goroutine is constantly iterating listeners.
+		buf := make([]byte, 4096)
+		_ = ws.SetReadDeadline(time.Now().Add(time.Second))
+		_, _ = ws.Read(buf)
+		for i := 0; i < 500; i++ {
+			_ = ws.SetWriteDeadline(time.Now().Add(time.Second))
+			if _, err := ws.Write([]byte(`{"event":"e","topic":"topic","payload":{}}`)); err != nil {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ch := newChannel("topic", wsURL)
+	ch.On("e", func(*Channel, *Message) {})
+
+	if err := ch.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	defer ch.Close()
+
+	// Hammer the listener slice while the read goroutine iterates it.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		ch.On("x", func(*Channel, *Message) {})
+		ch.RemoveCallbacksForEvent("x")
+	}
+}
+
+// TestPanickingListenerDoesNotLeakConnection verifies that a panic in a
+// user-supplied listener doesn't crash the read goroutine, doesn't kill
+// the process, and doesn't leak the websocket. Pre-fix, the panic
+// propagated out of handleCallbacks, the cleanup code never ran, and
+// IsConnected stayed true forever.
+func TestPanickingListenerDoesNotLeakConnection(t *testing.T) {
+	var messages atomic.Int64
+	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		buf := make([]byte, 4096)
+		_ = ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, _ = ws.Read(buf)
+		for range 5 {
+			_ = ws.SetWriteDeadline(time.Now().Add(time.Second))
+			if _, err := ws.Write([]byte(`{"event":"e","topic":"topic","payload":{}}`)); err != nil {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		// Hold the connection so we can verify per-message survival before
+		// the test tears the channel down.
+		_ = ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, _ = ws.Read(buf)
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ch := newChannel("topic", wsURL)
+	ch.On("e", func(*Channel, *Message) {
+		messages.Add(1)
+		panic("boom")
+	})
+
+	if err := ch.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	defer ch.Close()
+
+	// All five server-pushed messages should be delivered despite each
+	// listener invocation panicking.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && messages.Load() < 5 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := messages.Load(); got < 5 {
+		t.Errorf("listener invoked %d times; want 5 (panic killed the read goroutine)", got)
+	}
+	if !ch.IsConnected() {
+		t.Error("IsConnected=false after panicking listeners; read goroutine died without staying alive")
+	}
+}
+
+// TestPanickingLifecycleCallbacksDoNotCrash verifies that a panic inside
+// a user-supplied OnConnect/OnDisconnect doesn't crash the process. Both
+// callbacks run in their own goroutines, so without a recover guard a
+// faulty callback would propagate up and terminate the whole program.
+// We exercise the full connect/disconnect cycle and confirm the channel
+// still tears down cleanly afterward.
+func TestPanickingLifecycleCallbacksDoNotCrash(t *testing.T) {
+	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		buf := make([]byte, 4096)
+		_ = ws.SetReadDeadline(time.Now().Add(time.Second))
+		_, _ = ws.Read(buf) // read phx_join, then drop
+		ws.Close()
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ch := newChannel("topic", wsURL)
+
+	var connects, disconnects atomic.Int64
+	ch.OnConnect = func(*Channel) {
+		connects.Add(1)
+		panic("boom-connect")
+	}
+	ch.OnDisconnect = func(*Channel) {
+		disconnects.Add(1)
+		panic("boom-disconnect")
+	}
+
+	if err := ch.Listen(); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && (connects.Load() < 1 || disconnects.Load() < 1) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if connects.Load() < 1 {
+		t.Errorf("OnConnect never fired; got %d", connects.Load())
+	}
+	if disconnects.Load() < 1 {
+		t.Errorf("OnDisconnect never fired; got %d", disconnects.Load())
+	}
+
+	// Close must complete; if a panic killed an internal goroutine without
+	// signalling the WG, this would block.
+	done := make(chan struct{})
+	go func() { ch.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() blocked after panicking lifecycle callbacks")
+	}
+}
+
+// TestListenIsOnce verifies that calling Listen() a second time returns
+// errChannelAlreadyStarted. Pre-fix, a second Listen call spawned a second
+// keepAlive goroutine — both would heartbeat on the same socket and both
+// would race their cleanup defers on Close().
+func TestListenIsOnce(t *testing.T) {
+	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		buf := make([]byte, 4096)
+		for {
+			_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if _, err := ws.Read(buf); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ch := newChannel("topic", wsURL)
+	defer ch.Close()
+
+	if err := ch.Listen(); err != nil {
+		t.Fatalf("first Listen: %v", err)
+	}
+	if err := ch.Listen(); !errors.Is(err, errChannelAlreadyStarted) {
+		t.Errorf("second Listen: got err=%v; want errChannelAlreadyStarted", err)
+	}
+}
+
+// TestListenAfterFailureRetries verifies that if Listen()'s underlying
+// open() fails, started is reset and the channel can be retried.
+func TestListenAfterFailureRetries(t *testing.T) {
+	ch := newChannel("topic", "ws://127.0.0.1:1") // unroutable
+	if err := ch.Listen(); err == nil {
+		t.Fatal("expected first Listen to fail against unroutable URL")
+	}
+	// started must be reset on failure so the second call can proceed past
+	// the CompareAndSwap guard. We expect this second call to also fail
+	// (still unroutable), but it must *not* return errChannelAlreadyStarted.
+	if err := ch.Listen(); errors.Is(err, errChannelAlreadyStarted) {
+		t.Errorf("second Listen returned errChannelAlreadyStarted; started not reset")
+	}
+	ch.Close()
+}
+
+// TestConcurrentListenAndClose stresses the Listen/Close ordering. Pre-fix,
+// Close()'s keepAliveWG.Wait() could land on a zero counter just before
+// Listen()'s Add(1), a sync.WaitGroup misuse. Run under -race.
+func TestConcurrentListenAndClose(t *testing.T) {
+	for range 200 {
+		ch := newChannel("topic", "ws://127.0.0.1:1") // unroutable; open() fails fast
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = ch.Listen()
+		}()
+		go func() {
+			defer wg.Done()
+			ch.Close()
+		}()
+		wg.Wait()
+		ch.Close() // ensure full teardown
+	}
+}
+
+// TestCloseFromOnConnect verifies that calling Close() from inside the
+// OnConnect callback does not deadlock. On the reconnect path, OnConnect
+// runs on the keepAlive goroutine, so a synchronous Close()+Wait() there
+// would block on itself.
+func TestCloseFromOnConnect(t *testing.T) {
+	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		buf := make([]byte, 4096)
+		_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_, _ = ws.Read(buf)
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ch := newChannel("topic", wsURL)
+
+	closed := make(chan struct{})
+	var once sync.Once
+	ch.OnConnect = func(c *Channel) {
+		once.Do(func() {
+			c.Close()
+			close(closed)
+		})
+	}
+
+	if err := ch.Listen(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close() from inside OnConnect deadlocked")
+	}
+}
+
+// TestCloseAfterSendOnly verifies that Close() tears down the websocket and
+// fires OnDisconnect even when Listen() was never called. Pre-fix, the ws
+// cleanup lived only in keepAlive's defer, so a Send-initiated connection
+// leaked the socket (and stayed IsConnected==true) until the read deadline
+// expired ~10s later.
+func TestCloseAfterSendOnly(t *testing.T) {
+	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		buf := make([]byte, 4096)
+		for {
+			_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if _, err := ws.Read(buf); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ch := newChannel("topic", wsURL)
+
+	var disconnects atomic.Int64
+	ch.OnDisconnect = func(*Channel) { disconnects.Add(1) }
+
+	if err := ch.Send("e", map[string]interface{}{"k": "v"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if !ch.IsConnected() {
+		t.Fatal("Send did not establish a connection")
+	}
+
+	ch.Close()
+
+	if ch.IsConnected() {
+		t.Error("IsConnected still true after Close in Send-only mode")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && disconnects.Load() == 0 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if disconnects.Load() != 1 {
+		t.Errorf("OnDisconnect count = %d; want 1", disconnects.Load())
 	}
 }
