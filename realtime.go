@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,7 @@ const (
 
 	dialTimeout         = 10 * time.Second
 	writeTimeout        = 10 * time.Second
+	joinReplyTimeout    = 10 * time.Second
 	initialReconnectGap = 500 * time.Millisecond
 	maxReconnectGap     = 30 * time.Second
 )
@@ -89,6 +91,7 @@ type Channel struct {
 	closeChan     chan struct{}
 	reconnectChan chan struct{}
 	keepAliveWG   sync.WaitGroup
+	nextRef       atomic.Uint64
 	OnDisconnect  func(*Channel)
 	OnConnect     func(*Channel)
 }
@@ -303,7 +306,8 @@ func (c *Channel) open() error {
 		return err
 	}
 
-	msg := &Message{Topic: c.Topic, Event: phxJoin, Payload: map[string]interface{}{
+	joinRef := strconv.FormatUint(c.nextRef.Add(1), 10)
+	msg := &Message{Topic: c.Topic, Event: phxJoin, Ref: &joinRef, Payload: map[string]interface{}{
 		"config": map[string]interface{}{
 			"broadcast": map[string]interface{}{
 				"self": true,
@@ -319,6 +323,10 @@ func (c *Channel) open() error {
 		return err
 	}
 	if _, err := newWs.Write(msgBytes); err != nil {
+		newWs.Close()
+		return err
+	}
+	if err := c.awaitJoinReply(newWs, joinRef); err != nil {
 		newWs.Close()
 		return err
 	}
@@ -356,6 +364,43 @@ func (c *Channel) open() error {
 		go c.fireOnConnect()
 	}
 	return nil
+}
+
+// awaitJoinReply blocks on ws until the server's phx_reply for our join (matched
+// by ref) arrives, or it sees a phx_error / the deadline / a read error. A
+// successful join is signaled by payload.status == "ok"; anything else is
+// surfaced as an error so the caller can tear down newWs and (if appropriate)
+// back off and retry. Without this step the client cannot distinguish an
+// accepted join from one the server rejected (e.g. auth/RLS), which manifests
+// as "connected" channels that silently never receive broadcasts.
+func (c *Channel) awaitJoinReply(ws *websocket.Conn, joinRef string) error {
+	if err := ws.SetReadDeadline(time.Now().Add(joinReplyTimeout)); err != nil {
+		return err
+	}
+	buf := make([]byte, maxMessageBytes)
+	for {
+		n, err := ws.Read(buf)
+		if err != nil {
+			return fmt.Errorf("waiting for join reply: %w", err)
+		}
+		var m Message
+		if err := json.Unmarshal(buf[:n], &m); err != nil {
+			continue
+		}
+		if m.Topic != c.Topic {
+			continue
+		}
+		if m.Event == phxError {
+			return fmt.Errorf("server rejected channel join (phx_error): %v", m.Payload)
+		}
+		if m.Event == phxReply && m.Ref != nil && *m.Ref == joinRef {
+			status, _ := m.Payload["status"].(string)
+			if status == "ok" {
+				return nil
+			}
+			return fmt.Errorf("channel join rejected: status=%q payload=%v", status, m.Payload)
+		}
+	}
 }
 
 // dial wraps websocket.DialConfig with cancellation on closeChan, so Close()
@@ -426,6 +471,16 @@ func (c *Channel) handleCallbacks(ws *websocket.Conn) {
 		}
 		if message.Event == phxReply {
 			continue
+		}
+		// A phx_close or phx_error on our topic means the server has dropped
+		// our channel subscription while keeping the websocket open (Phoenix
+		// inactivity reaper, RLS revocation, server-side drain, etc.). Without
+		// this, the TCP-level read deadline never fires (heartbeats on the
+		// "phoenix" topic keep the socket warm) and we silently stay
+		// "connected" while broadcasts go nowhere. Returning here lets the
+		// defer mark us disconnected and signal a fresh join via reconnectChan.
+		if message.Topic == c.Topic && (message.Event == phxClose || message.Event == phxError) {
+			return
 		}
 		c.mu.Lock()
 		listeners := append([]Listener(nil), c.listeners...)

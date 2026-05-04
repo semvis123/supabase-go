@@ -13,6 +13,39 @@ import (
 	"golang.org/x/net/websocket"
 )
 
+// replyJoinOK consumes the next frame from ws, expects it to be a phx_join,
+// and writes back a phx_reply with status:"ok" matching the join's ref.
+// All test fake servers must call this before any other application traffic
+// because the client now blocks open() until it sees this reply.
+func replyJoinOK(ws *websocket.Conn) error {
+	var raw []byte
+	if err := ws.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		return err
+	}
+	if err := websocket.Message.Receive(ws, &raw); err != nil {
+		return err
+	}
+	var join Message
+	if err := json.Unmarshal(raw, &join); err != nil {
+		return err
+	}
+	reply := Message{
+		Topic:   join.Topic,
+		Event:   phxReply,
+		Ref:     join.Ref,
+		Payload: map[string]interface{}{"status": "ok"},
+	}
+	b, err := json.Marshal(reply)
+	if err != nil {
+		return err
+	}
+	if err := ws.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		return err
+	}
+	_, err = ws.Write(b)
+	return err
+}
+
 // TestOpenWhileConnectedIsNoop verifies that calling open() while the channel
 // is already connected does not create a second socket and does not fire
 // OnConnect again. The pre-fix behavior re-dialed unconditionally, leaving a
@@ -20,6 +53,9 @@ import (
 // connect/disconnect storm.
 func TestOpenWhileConnectedIsNoop(t *testing.T) {
 	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		if err := replyJoinOK(ws); err != nil {
+			return
+		}
 		buf := make([]byte, 4096)
 		for {
 			_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -84,9 +120,9 @@ func TestChannelReconnectOneForOne(t *testing.T) {
 
 	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
 		accepts.Add(1)
-		buf := make([]byte, 4096)
-		_ = ws.SetReadDeadline(time.Now().Add(time.Second))
-		_, _ = ws.Read(buf) // read phx_join, then hang up
+		if err := replyJoinOK(ws); err != nil {
+			return
+		}
 		ws.Close()
 	}))
 	defer srv.Close()
@@ -139,9 +175,9 @@ func TestCloseStaysClosed(t *testing.T) {
 
 	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
 		accepts.Add(1)
-		buf := make([]byte, 4096)
-		_ = ws.SetReadDeadline(time.Now().Add(time.Second))
-		_, _ = ws.Read(buf)
+		if err := replyJoinOK(ws); err != nil {
+			return
+		}
 		ws.Close()
 	}))
 	defer srv.Close()
@@ -211,9 +247,9 @@ func TestCloseStaysClosed(t *testing.T) {
 // goroutine forever.
 func TestCloseFromOnDisconnect(t *testing.T) {
 	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
-		buf := make([]byte, 4096)
-		_ = ws.SetReadDeadline(time.Now().Add(time.Second))
-		_, _ = ws.Read(buf)
+		if err := replyJoinOK(ws); err != nil {
+			return
+		}
 		ws.Close()
 	}))
 	defer srv.Close()
@@ -249,6 +285,10 @@ func TestConcurrentSendNoFrameCorruption(t *testing.T) {
 	var parseFailures atomic.Int64
 
 	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		if err := replyJoinOK(ws); err != nil {
+			return
+		}
+		received.Add(1) // count the join so the existing expected+1 assertion still holds
 		for {
 			_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
 			var raw []byte
@@ -314,11 +354,11 @@ func TestConcurrentSendNoFrameCorruption(t *testing.T) {
 // -race; without locking on listeners, the detector fires.
 func TestConcurrentListenerMutationRace(t *testing.T) {
 	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
-		// Read the join, then push events back to the client at high frequency
-		// so the read goroutine is constantly iterating listeners.
-		buf := make([]byte, 4096)
-		_ = ws.SetReadDeadline(time.Now().Add(time.Second))
-		_, _ = ws.Read(buf)
+		// Read the join, reply OK, then push events back to the client at high
+		// frequency so the read goroutine is constantly iterating listeners.
+		if err := replyJoinOK(ws); err != nil {
+			return
+		}
 		for i := 0; i < 500; i++ {
 			_ = ws.SetWriteDeadline(time.Now().Add(time.Second))
 			if _, err := ws.Write([]byte(`{"event":"e","topic":"topic","payload":{}}`)); err != nil {
@@ -354,9 +394,9 @@ func TestConcurrentListenerMutationRace(t *testing.T) {
 func TestPanickingListenerDoesNotLeakConnection(t *testing.T) {
 	var messages atomic.Int64
 	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
-		buf := make([]byte, 4096)
-		_ = ws.SetReadDeadline(time.Now().Add(2 * time.Second))
-		_, _ = ws.Read(buf)
+		if err := replyJoinOK(ws); err != nil {
+			return
+		}
 		for range 5 {
 			_ = ws.SetWriteDeadline(time.Now().Add(time.Second))
 			if _, err := ws.Write([]byte(`{"event":"e","topic":"topic","payload":{}}`)); err != nil {
@@ -366,6 +406,7 @@ func TestPanickingListenerDoesNotLeakConnection(t *testing.T) {
 		}
 		// Hold the connection so we can verify per-message survival before
 		// the test tears the channel down.
+		buf := make([]byte, 4096)
 		_ = ws.SetReadDeadline(time.Now().Add(2 * time.Second))
 		_, _ = ws.Read(buf)
 	}))
@@ -405,9 +446,9 @@ func TestPanickingListenerDoesNotLeakConnection(t *testing.T) {
 // still tears down cleanly afterward.
 func TestPanickingLifecycleCallbacksDoNotCrash(t *testing.T) {
 	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
-		buf := make([]byte, 4096)
-		_ = ws.SetReadDeadline(time.Now().Add(time.Second))
-		_, _ = ws.Read(buf) // read phx_join, then drop
+		if err := replyJoinOK(ws); err != nil {
+			return
+		}
 		ws.Close()
 	}))
 	defer srv.Close()
@@ -457,6 +498,9 @@ func TestPanickingLifecycleCallbacksDoNotCrash(t *testing.T) {
 // would race their cleanup defers on Close().
 func TestListenIsOnce(t *testing.T) {
 	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		if err := replyJoinOK(ws); err != nil {
+			return
+		}
 		buf := make([]byte, 4096)
 		for {
 			_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -522,6 +566,9 @@ func TestConcurrentListenAndClose(t *testing.T) {
 // would block on itself.
 func TestCloseFromOnConnect(t *testing.T) {
 	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		if err := replyJoinOK(ws); err != nil {
+			return
+		}
 		buf := make([]byte, 4096)
 		_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
 		_, _ = ws.Read(buf)
@@ -558,6 +605,9 @@ func TestCloseFromOnConnect(t *testing.T) {
 // expired ~10s later.
 func TestCloseAfterSendOnly(t *testing.T) {
 	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		if err := replyJoinOK(ws); err != nil {
+			return
+		}
 		buf := make([]byte, 4096)
 		for {
 			_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -593,5 +643,189 @@ func TestCloseAfterSendOnly(t *testing.T) {
 	}
 	if disconnects.Load() != 1 {
 		t.Errorf("OnDisconnect count = %d; want 1", disconnects.Load())
+	}
+}
+
+// TestJoinRejectionFailsListen verifies that when the Phoenix server replies
+// to phx_join with status:"error", the client tears down the socket and surfaces
+// the rejection rather than reporting a healthy connection. Pre-fix, the client
+// dropped phx_reply silently, so an auth/RLS-rejected join still set
+// IsConnected=true and fired OnConnect — the symptom the user observed:
+// "agent shows connected but website cannot reach it".
+func TestJoinRejectionFailsListen(t *testing.T) {
+	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		var raw []byte
+		_ = ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if err := websocket.Message.Receive(ws, &raw); err != nil {
+			return
+		}
+		var join Message
+		if err := json.Unmarshal(raw, &join); err != nil {
+			return
+		}
+		reply := Message{
+			Topic:   join.Topic,
+			Event:   phxReply,
+			Ref:     join.Ref,
+			Payload: map[string]interface{}{"status": "error", "response": map[string]interface{}{"reason": "unauthorized"}},
+		}
+		b, _ := json.Marshal(reply)
+		_ = ws.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		_, _ = ws.Write(b)
+		// Hold so the client sees the reply before the socket dies.
+		_ = ws.SetReadDeadline(time.Now().Add(time.Second))
+		_, _ = ws.Read(make([]byte, 1024))
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ch := newChannel("topic", wsURL)
+	defer ch.Close()
+
+	var connects atomic.Int64
+	ch.OnConnect = func(*Channel) { connects.Add(1) }
+
+	err := ch.open()
+	if err == nil {
+		t.Fatal("open() succeeded against a server that rejected the join")
+	}
+	if !strings.Contains(err.Error(), "rejected") {
+		t.Errorf("open() error = %v; want one mentioning 'rejected'", err)
+	}
+	if ch.IsConnected() {
+		t.Error("IsConnected=true after rejected join")
+	}
+	if connects.Load() != 0 {
+		t.Errorf("OnConnect fired %d times for rejected join; want 0", connects.Load())
+	}
+}
+
+// TestServerInitiatedCloseTriggersRejoin verifies that when the server sends
+// phx_close on the channel's topic mid-session, the client tears the socket
+// down and re-joins instead of silently staying "connected" while no
+// broadcasts arrive. This is the long-uptime silent-failure mode: Phoenix's
+// inactivity reaper / RLS revocation / server drain sends phx_close on the
+// topic but keeps the websocket open, so the 10s read deadline never fires
+// (heartbeats on the "phoenix" topic keep the socket warm).
+func TestServerInitiatedCloseTriggersRejoin(t *testing.T) {
+	var joins atomic.Int64
+	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		// First join: ack, then send phx_close on the topic and wait for the
+		// client to disconnect. The client should treat this as "channel gone"
+		// and rejoin.
+		// Second join (and beyond): ack and hold the connection open, proving
+		// the rejoin happened.
+		for {
+			var raw []byte
+			_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if err := websocket.Message.Receive(ws, &raw); err != nil {
+				return
+			}
+			var join Message
+			if err := json.Unmarshal(raw, &join); err != nil {
+				return
+			}
+			if join.Event != phxJoin {
+				continue
+			}
+			n := joins.Add(1)
+			reply := Message{Topic: join.Topic, Event: phxReply, Ref: join.Ref, Payload: map[string]interface{}{"status": "ok"}}
+			b, _ := json.Marshal(reply)
+			_ = ws.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			if _, err := ws.Write(b); err != nil {
+				return
+			}
+			if n == 1 {
+				closeMsg := Message{Topic: join.Topic, Event: phxClose, Payload: map[string]interface{}{}}
+				b, _ := json.Marshal(closeMsg)
+				_ = ws.SetWriteDeadline(time.Now().Add(2 * time.Second))
+				if _, err := ws.Write(b); err != nil {
+					return
+				}
+				// Drain whatever the client sends until it disconnects on its end.
+				buf := make([]byte, 4096)
+				for {
+					_ = ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+					if _, err := ws.Read(buf); err != nil {
+						return
+					}
+				}
+			}
+			// Second+ join: keep the connection alive briefly so the test
+			// can assert the rejoin happened.
+			buf := make([]byte, 4096)
+			for {
+				_ = ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+				if _, err := ws.Read(buf); err != nil {
+					return
+				}
+			}
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ch := newChannel("topic", wsURL)
+	defer ch.Close()
+
+	var connects, disconnects atomic.Int64
+	ch.OnConnect = func(*Channel) { connects.Add(1) }
+	ch.OnDisconnect = func(*Channel) { disconnects.Add(1) }
+
+	if err := ch.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && joins.Load() < 2 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if joins.Load() < 2 {
+		t.Fatalf("server saw %d joins; want >= 2 (initial + rejoin after phx_close)", joins.Load())
+	}
+	if disconnects.Load() < 1 {
+		t.Errorf("OnDisconnect fired %d times after phx_close; want >= 1", disconnects.Load())
+	}
+	if connects.Load() < 2 {
+		t.Errorf("OnConnect fired %d times; want >= 2 (initial + reconnect)", connects.Load())
+	}
+}
+
+// TestJoinErrorEventFailsListen verifies that a phx_error frame on the
+// channel's topic — Phoenix's other rejection signal — is also surfaced as
+// a join failure rather than ignored.
+func TestJoinErrorEventFailsListen(t *testing.T) {
+	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		var raw []byte
+		_ = ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if err := websocket.Message.Receive(ws, &raw); err != nil {
+			return
+		}
+		var join Message
+		if err := json.Unmarshal(raw, &join); err != nil {
+			return
+		}
+		errMsg := Message{
+			Topic:   join.Topic,
+			Event:   phxError,
+			Payload: map[string]interface{}{"reason": "boom"},
+		}
+		b, _ := json.Marshal(errMsg)
+		_ = ws.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		_, _ = ws.Write(b)
+		_ = ws.SetReadDeadline(time.Now().Add(time.Second))
+		_, _ = ws.Read(make([]byte, 1024))
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ch := newChannel("topic", wsURL)
+	defer ch.Close()
+
+	if err := ch.open(); err == nil {
+		t.Fatal("open() succeeded despite phx_error on join")
+	}
+	if ch.IsConnected() {
+		t.Error("IsConnected=true after phx_error on join")
 	}
 }
