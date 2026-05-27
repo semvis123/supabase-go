@@ -327,10 +327,23 @@ func (f *file) UploadOrUpdate(path string, data io.Reader, update bool, opts *Fi
 	if err != nil {
 		return FileResponse{}, err
 	}
+	defer res.Body.Close()
 
 	resBody, err := io.ReadAll(res.Body)
 	if err != nil {
 		return FileResponse{}, err
+	}
+
+	// when not success, supabase returns a json error body instead of the
+	// upload result. Without this check a rejected upload is reported as
+	// success, so callers treat objects that were never stored as present
+	// and later fail to download them ("file not found").
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		var resErr *FileErrorResponse
+		if err := json.Unmarshal(resBody, &resErr); err != nil {
+			return FileResponse{}, fmt.Errorf("upload failed: status %d: %s", res.StatusCode, resBody)
+		}
+		return FileResponse{}, resErr
 	}
 
 	var response FileResponse
