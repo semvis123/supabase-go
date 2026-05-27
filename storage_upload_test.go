@@ -33,6 +33,32 @@ func TestUploadReturnsErrorOnNon2xx(t *testing.T) {
 	}
 }
 
+// Upload must send the content-type the caller asked for, rather than
+// forcing a default. A bucket with allowed_mime_types will otherwise
+// reject the upload with 415.
+func TestUploadHonorsContentType(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("content-type")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"Key":"test-bucket/folder/doc.json"}`))
+	}))
+	defer srv.Close()
+
+	client := CreateClient(srv.URL, "test-key")
+	_, err := client.Storage.From("test-bucket").Upload(
+		"folder/doc.json",
+		strings.NewReader(`{"hello":"world"}`),
+		&FileUploadOptions{ContentType: "application/json"},
+	)
+	if err != nil {
+		t.Fatalf("upload error: %v", err)
+	}
+	if got != "application/json" {
+		t.Fatalf("content-type not honored: got %q want application/json", got)
+	}
+}
+
 func TestUploadSucceedsOn2xx(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
