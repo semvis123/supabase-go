@@ -1,7 +1,6 @@
 package supabase
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -289,7 +288,15 @@ func (f *file) UploadOrUpdate(path string, data io.Reader, update bool, opts *Fi
 		mergedOpts.Upsert = opts.Upsert
 	}
 
-	body := bufio.NewReader(data)
+	// Buffer the body so net/http sets Content-Length (and GetBody for
+	// redirect/retry replay). Passing a non-(bytes/strings) reader makes
+	// http.NewRequest fall back to Transfer-Encoding: chunked with no
+	// length, which Supabase Storage rejects with a 400 — the upload then
+	// never lands in the bucket.
+	buf, err := io.ReadAll(data)
+	if err != nil {
+		return FileResponse{}, err
+	}
 	_path := removeEmptyFolder(f.BucketId + "/" + path)
 	client := &http.Client{}
 
@@ -297,7 +304,6 @@ func (f *file) UploadOrUpdate(path string, data io.Reader, update bool, opts *Fi
 		method string
 		req    *http.Request
 		res    *http.Response
-		err    error
 	)
 
 	if update {
@@ -307,7 +313,7 @@ func (f *file) UploadOrUpdate(path string, data io.Reader, update bool, opts *Fi
 	}
 
 	reqURL := fmt.Sprintf("%s/%s/object/%s", f.storage.client.BaseURL, StorageEndpoint, _path)
-	req, err = http.NewRequest(method, reqURL, body)
+	req, err = http.NewRequest(method, reqURL, bytes.NewReader(buf))
 	if err != nil {
 		return FileResponse{}, err
 	}
