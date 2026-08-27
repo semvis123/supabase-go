@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	neturl "net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -71,9 +72,17 @@ type Channel struct {
 	Origin    string
 	listeners []Listener
 
-	mu        sync.Mutex // protects ws, connected, listeners
+	mu        sync.Mutex // protects ws, connected, listeners, accessToken
 	ws        *websocket.Conn
 	connected bool
+
+	// accessToken is presented in the phx_join payload. Realtime v2.43+
+	// rejects a join that omits it (the server replies "Unknown Error on
+	// Channel" and logs :invalid_token); older servers fall back to the
+	// apikey query param and simply ignore the field, so sending it is
+	// backward compatible. Defaults to the apikey carried in Url so the
+	// token we join with is the one we connected with.
+	accessToken string
 
 	// openMu serializes open() so concurrent callers don't each create a
 	// fresh dial+OnConnect cycle for the same logical connect.
@@ -96,16 +105,38 @@ type Channel struct {
 	OnConnect     func(*Channel)
 }
 
+// apiKeyFromUrl extracts the apikey query parameter from a realtime
+// websocket URL. Returns "" when the URL is unparseable or carries no
+// apikey, in which case the join payload omits access_token entirely and
+// behaves exactly as it did before.
+func apiKeyFromUrl(rawUrl string) string {
+	parsed, err := neturl.Parse(rawUrl)
+	if err != nil {
+		return ""
+	}
+	return parsed.Query().Get("apikey")
+}
+
 func newChannel(topic string, url string) *Channel {
 	return &Channel{
 		Topic:         topic,
 		Url:           url,
+		accessToken:   apiKeyFromUrl(url),
 		Origin:        "http://localhost/",
 		closeChan:     make(chan struct{}),
 		reconnectChan: make(chan struct{}, 1),
 		OnDisconnect:  func(*Channel) {},
 		OnConnect:     func(*Channel) {},
 	}
+}
+
+// SetAccessToken replaces the token presented on subsequent joins. Use it
+// to install a refreshed user JWT; the new token takes effect on the next
+// (re)connect, not on the current one. Safe to call concurrently.
+func (c *Channel) SetAccessToken(token string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.accessToken = token
 }
 
 type Listener struct {
@@ -307,12 +338,20 @@ func (c *Channel) open() error {
 	}
 
 	joinRef := strconv.FormatUint(c.nextRef.Add(1), 10)
-	msg := &Message{Topic: c.Topic, Event: phxJoin, Ref: &joinRef, Payload: map[string]interface{}{
+	joinPayload := map[string]interface{}{
 		"config": map[string]interface{}{
 			"broadcast": map[string]interface{}{
 				"self": true,
 			},
-		}}}
+		},
+	}
+	c.mu.Lock()
+	token := c.accessToken
+	c.mu.Unlock()
+	if token != "" {
+		joinPayload["access_token"] = token
+	}
+	msg := &Message{Topic: c.Topic, Event: phxJoin, Ref: &joinRef, Payload: joinPayload}
 	msgBytes, err := json.Marshal(msg)
 	if err != nil {
 		newWs.Close()

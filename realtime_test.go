@@ -829,3 +829,152 @@ func TestJoinErrorEventFailsListen(t *testing.T) {
 		t.Error("IsConnected=true after phx_error on join")
 	}
 }
+
+// captureJoin consumes the next frame, asserts it is a phx_join, sends back an
+// ok reply, and hands the decoded join payload to the caller.
+func captureJoin(ws *websocket.Conn, out chan<- map[string]interface{}) error {
+	var raw []byte
+	if err := ws.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		return err
+	}
+	if err := websocket.Message.Receive(ws, &raw); err != nil {
+		return err
+	}
+	var join Message
+	if err := json.Unmarshal(raw, &join); err != nil {
+		return err
+	}
+	select {
+	case out <- join.Payload:
+	default:
+	}
+	reply := Message{
+		Topic:   join.Topic,
+		Event:   phxReply,
+		Ref:     join.Ref,
+		Payload: map[string]interface{}{"status": "ok"},
+	}
+	b, err := json.Marshal(reply)
+	if err != nil {
+		return err
+	}
+	if err := ws.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		return err
+	}
+	_, err = ws.Write(b)
+	return err
+}
+
+// joinPayloadServer spins up a fake realtime server that records the payload of
+// every phx_join it receives.
+func joinPayloadServer(t *testing.T) (string, chan map[string]interface{}) {
+	t.Helper()
+	joins := make(chan map[string]interface{}, 8)
+	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		if err := captureJoin(ws, joins); err != nil {
+			return
+		}
+		buf := make([]byte, 4096)
+		for {
+			_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if _, err := ws.Read(buf); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return "ws" + strings.TrimPrefix(srv.URL, "http"), joins
+}
+
+// TestJoinIncludesAccessTokenFromUrl is the regression test for the join being
+// rejected by Realtime v2.43+. That version requires access_token in the
+// phx_join payload; without it the server replies "Unknown Error on Channel"
+// and logs :invalid_token, so every channel — commands and indicators alike —
+// fails to join. The token defaults to the apikey already carried in Url.
+func TestJoinIncludesAccessTokenFromUrl(t *testing.T) {
+	wsURL, joins := joinPayloadServer(t)
+
+	ch := newChannel("topic", wsURL+"?apikey=the-anon-key&vsn=1.0.0")
+	defer ch.Close()
+	if err := ch.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+
+	select {
+	case payload := <-joins:
+		if got := payload["access_token"]; got != "the-anon-key" {
+			t.Fatalf("join access_token = %v, want %q", got, "the-anon-key")
+		}
+		if _, ok := payload["config"]; !ok {
+			t.Fatalf("join payload lost config: %v", payload)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for join")
+	}
+}
+
+// TestJoinOmitsAccessTokenWhenAbsent verifies that a URL without an apikey
+// still joins with the exact pre-fix payload, so callers using
+// ChannelWithUrl against a server that does not expect the field are
+// unaffected.
+func TestJoinOmitsAccessTokenWhenAbsent(t *testing.T) {
+	wsURL, joins := joinPayloadServer(t)
+
+	ch := newChannel("topic", wsURL)
+	defer ch.Close()
+	if err := ch.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+
+	select {
+	case payload := <-joins:
+		if _, ok := payload["access_token"]; ok {
+			t.Fatalf("access_token present for URL without apikey: %v", payload)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for join")
+	}
+}
+
+// TestSetAccessTokenAppliesToReconnectJoin covers the path that matters in
+// production: a daemon that started before a token rotation must present the
+// new token when the socket drops and re-joins. open() builds the join for
+// both the initial connect and every reconnect, so the refreshed token has to
+// be read at join time rather than captured at construction.
+func TestSetAccessTokenAppliesToReconnectJoin(t *testing.T) {
+	wsURL, joins := joinPayloadServer(t)
+
+	ch := newChannel("topic", wsURL+"?apikey=old-token")
+	defer ch.Close()
+	if err := ch.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+
+	select {
+	case payload := <-joins:
+		if got := payload["access_token"]; got != "old-token" {
+			t.Fatalf("initial join access_token = %v, want %q", got, "old-token")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for initial join")
+	}
+
+	ch.SetAccessToken("new-token")
+
+	// Drop the socket so the keepAlive loop reconnects and re-joins.
+	ch.mu.Lock()
+	ws := ch.ws
+	ch.mu.Unlock()
+	if ws != nil {
+		ws.Close()
+	}
+
+	select {
+	case payload := <-joins:
+		if got := payload["access_token"]; got != "new-token" {
+			t.Fatalf("reconnect join access_token = %v, want %q", got, "new-token")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for reconnect join")
+	}
+}
