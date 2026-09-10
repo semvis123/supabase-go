@@ -138,8 +138,12 @@ func TestChannelReconnectOneForOne(t *testing.T) {
 		t.Fatalf("Listen: %v", err)
 	}
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) && accepts.Load() < 10 {
+	// Reconnects are paced by the backoff (a server that drops us straight
+	// after the join is treated as unstable), so this waits on a handful of
+	// cycles rather than a burst. What is under test is the one-for-one
+	// accounting below, not the rate.
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) && accepts.Load() < 4 {
 		time.Sleep(20 * time.Millisecond)
 	}
 
@@ -151,8 +155,8 @@ func TestChannelReconnectOneForOne(t *testing.T) {
 	dc := disconnects.Load()
 	t.Logf("accepts=%d connects=%d disconnects=%d", ac, cc, dc)
 
-	if ac < 5 {
-		t.Fatalf("want >= 5 accepts, got %d", ac)
+	if ac < 3 {
+		t.Fatalf("want >= 3 accepts, got %d", ac)
 	}
 	// Slack of +1 for the in-flight cycle when srv.Close() happens.
 	if cc > ac {
@@ -976,5 +980,74 @@ func TestSetAccessTokenAppliesToReconnectJoin(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for reconnect join")
+	}
+}
+
+// TestReconnectBackoffThrottlesUnstableConnection pins the pacing of a server
+// that accepts the join and then drops the channel immediately. open() succeeds
+// every time in that case, so a backoff that only delays after a failed open
+// never engages and the retry spins as fast as the round trip allows -- which
+// showed up in the field as a channel connecting and disconnecting ~2x/second
+// for over a minute, flapping every consumer of OnConnect/OnDisconnect.
+func TestReconnectBackoffThrottlesUnstableConnection(t *testing.T) {
+	var accepts atomic.Int64
+	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		accepts.Add(1)
+		if err := replyJoinOK(ws); err != nil {
+			return
+		}
+		ws.Close() // accepted, then dropped straight back
+	}))
+	defer srv.Close()
+
+	ch := newChannel("topic", "ws"+strings.TrimPrefix(srv.URL, "http"))
+	if err := ch.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ch.Close()
+
+	time.Sleep(3 * time.Second)
+	// Gaps run 500ms, 1s, 2s, ... so three seconds allows the initial join plus
+	// roughly three reattempts. Unthrottled this reached into the hundreds.
+	if n := accepts.Load(); n > 6 {
+		t.Errorf("accepts=%d in 3s; want the backoff to pace reattempts", n)
+	} else {
+		t.Logf("accepts=%d in 3s (paced)", n)
+	}
+}
+
+// TestReconnectBackoffResetsAfterStableConnection verifies the backoff does not
+// ratchet up permanently: a connection that stays up past minStableConnection
+// clears the gap, so an unrelated drop later still reconnects promptly.
+func TestReconnectBackoffResetsAfterStableConnection(t *testing.T) {
+	var accepts atomic.Int64
+	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		n := accepts.Add(1)
+		if err := replyJoinOK(ws); err != nil {
+			return
+		}
+		if n == 1 {
+			time.Sleep(minStableConnection + time.Second) // a durable connection
+		}
+		ws.Close()
+	}))
+	defer srv.Close()
+
+	ch := newChannel("topic", "ws"+strings.TrimPrefix(srv.URL, "http"))
+	var reconnected atomic.Int64
+	ch.OnConnect = func(*Channel) { reconnected.Add(1) }
+	if err := ch.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ch.Close()
+
+	// The first connection lasts, so its drop must reconnect at the initial gap
+	// rather than at a ratcheted-up one.
+	deadline := time.Now().Add(minStableConnection + 3*time.Second)
+	for time.Now().Before(deadline) && reconnected.Load() < 2 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if reconnected.Load() < 2 {
+		t.Errorf("no prompt reconnect after a stable connection dropped (connects=%d)", reconnected.Load())
 	}
 }

@@ -31,6 +31,10 @@ const (
 	joinReplyTimeout    = 10 * time.Second
 	initialReconnectGap = 500 * time.Millisecond
 	maxReconnectGap     = 30 * time.Second
+	// minStableConnection is how long a connection must survive before it counts
+	// as good enough to clear the reconnect backoff. Anything shorter is treated
+	// as a failed attempt: see reconnectWithBackoff.
+	minStableConnection = 5 * time.Second
 )
 
 var (
@@ -568,6 +572,7 @@ func (c *Channel) keepAlive() {
 	}
 
 	gap := initialReconnectGap
+	connectedAt := time.Now() // the Listen() that got us here
 	heartbeat := time.NewTicker(5 * time.Second)
 	defer heartbeat.Stop()
 	for {
@@ -575,9 +580,29 @@ func (c *Channel) keepAlive() {
 		case <-c.closeChan:
 			return
 		case <-c.reconnectChan:
+			// A connection that did not last is the server dropping us on
+			// purpose (Phoenix inactivity reaper, a rate limit, an RLS
+			// revocation), and open() reports success every time that happens.
+			// reconnectWithBackoff only ever delays after a *failed* open, so on
+			// its own it never throttles this case at all: the retry becomes an
+			// unthrottled loop that hammers the server and flaps every
+			// OnConnect/OnDisconnect consumer several times a second. Pace the
+			// reattempt here instead, and clear the backoff only once a
+			// connection has proved it can stay up.
+			if time.Since(connectedAt) >= minStableConnection {
+				gap = initialReconnectGap
+			} else {
+				select {
+				case <-c.closeChan:
+					return
+				case <-time.After(gap):
+				}
+				gap = min(gap*2, maxReconnectGap)
+			}
 			if !c.reconnectWithBackoff(&gap) {
 				return
 			}
+			connectedAt = time.Now()
 		case <-heartbeat.C:
 			writeErr := func() error {
 				c.writeMu.Lock()
@@ -618,7 +643,6 @@ func (c *Channel) reconnectWithBackoff(gap *time.Duration) bool {
 		default:
 		}
 		if err := c.open(); err == nil {
-			*gap = initialReconnectGap
 			return true
 		}
 		select {
