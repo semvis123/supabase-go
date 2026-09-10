@@ -1051,3 +1051,49 @@ func TestReconnectBackoffResetsAfterStableConnection(t *testing.T) {
 		t.Errorf("no prompt reconnect after a stable connection dropped (connects=%d)", reconnected.Load())
 	}
 }
+
+// TestLastDisconnectErrorReportsServerClose pins that a server-sent phx_close on
+// our topic is surfaced with its payload. Every teardown path funnels into the
+// same reasonless OnDisconnect, so without this a channel that the server is
+// deliberately dropping looks identical to a dropped socket and there is
+// nothing in a field log to tell them apart.
+func TestLastDisconnectErrorReportsServerClose(t *testing.T) {
+	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		if err := replyJoinOK(ws); err != nil {
+			return
+		}
+		_ = websocket.JSON.Send(ws, map[string]interface{}{
+			"topic":   "topic",
+			"event":   phxClose,
+			"payload": map[string]interface{}{"reason": "rate limited"},
+		})
+		time.Sleep(2 * time.Second)
+	}))
+	defer srv.Close()
+
+	ch := newChannel("topic", "ws"+strings.TrimPrefix(srv.URL, "http"))
+	got := make(chan error, 1)
+	ch.OnDisconnect = func(c *Channel) {
+		select {
+		case got <- c.LastDisconnectError():
+		default:
+		}
+	}
+	if err := ch.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ch.Close()
+
+	select {
+	case err := <-got:
+		if err == nil {
+			t.Fatal("LastDisconnectError() = nil; want the server close reason")
+		}
+		if !strings.Contains(err.Error(), "server closed channel") || !strings.Contains(err.Error(), "rate limited") {
+			t.Errorf("LastDisconnectError() = %v; want the phx_close event and payload", err)
+		}
+		t.Logf("reported: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnDisconnect never fired")
+	}
+}
