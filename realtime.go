@@ -95,6 +95,11 @@ type Channel struct {
 	// token we join with is the one we connected with.
 	accessToken string
 
+	// noBroadcastSelf, when true, joins with broadcast.self=false so the server
+	// does not echo this channel's own broadcasts back to it. The zero value
+	// keeps the historical self=true behaviour. Guarded by mu.
+	noBroadcastSelf bool
+
 	// openMu serializes open() so concurrent callers don't each create a
 	// fresh dial+OnConnect cycle for the same logical connect.
 	openMu sync.Mutex
@@ -148,6 +153,24 @@ func (c *Channel) SetAccessToken(token string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.accessToken = token
+}
+
+// SetBroadcastSelf controls whether Realtime echoes this channel's own
+// broadcasts back to it (the join config's broadcast.self). It defaults to
+// true, which is what request/response callers that listen on the channel they
+// send on expect.
+//
+// A high-rate publisher that only sends, or that already ignores its own
+// frames, should pass false: every echoed frame is an extra delivered event
+// counted against the project-wide max_events_per_second limit, so a 10 Hz
+// stream costs a third less with the echo off. The value is read when the join
+// is built, so it applies to the initial connect and to every reconnect; call
+// it before Listen() for the first join to honour it. Safe to call
+// concurrently.
+func (c *Channel) SetBroadcastSelf(self bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.noBroadcastSelf = !self
 }
 
 type Listener struct {
@@ -349,16 +372,17 @@ func (c *Channel) open() error {
 	}
 
 	joinRef := strconv.FormatUint(c.nextRef.Add(1), 10)
+	c.mu.Lock()
+	token := c.accessToken
+	self := !c.noBroadcastSelf
+	c.mu.Unlock()
 	joinPayload := map[string]interface{}{
 		"config": map[string]interface{}{
 			"broadcast": map[string]interface{}{
-				"self": true,
+				"self": self,
 			},
 		},
 	}
-	c.mu.Lock()
-	token := c.accessToken
-	c.mu.Unlock()
 	if token != "" {
 		joinPayload["access_token"] = token
 	}
