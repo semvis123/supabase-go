@@ -978,3 +978,78 @@ func TestSetAccessTokenAppliesToReconnectJoin(t *testing.T) {
 		t.Fatal("timed out waiting for reconnect join")
 	}
 }
+
+// joinBroadcastSelf digs broadcast.self out of a captured join payload.
+func joinBroadcastSelf(t *testing.T, payload map[string]interface{}) bool {
+	t.Helper()
+	cfg, _ := payload["config"].(map[string]interface{})
+	bc, _ := cfg["broadcast"].(map[string]interface{})
+	self, ok := bc["self"].(bool)
+	if !ok {
+		t.Fatalf("join payload has no boolean config.broadcast.self: %v", payload)
+	}
+	return self
+}
+
+// TestJoinBroadcastSelfDefaultsToTrue pins the long-standing behaviour: a
+// channel hears its own broadcasts unless the caller opts out. Existing
+// callers that listen on the channel they send on rely on the default, so it must
+// not change under them.
+func TestJoinBroadcastSelfDefaultsToTrue(t *testing.T) {
+	wsURL, joins := joinPayloadServer(t)
+
+	ch := newChannel("topic", wsURL)
+	defer ch.Close()
+	if err := ch.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+
+	select {
+	case payload := <-joins:
+		if !joinBroadcastSelf(t, payload) {
+			t.Fatal("default join has broadcast.self=false, want true")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for join")
+	}
+}
+
+// TestSetBroadcastSelfFalseAppliesToEveryJoin covers a high-rate publisher that
+// never wants its own messages back (every echoed frame costs a Realtime
+// "event" against the project-wide per-second limit). The option is read at
+// join time, so it must hold for the initial join and for every reconnect.
+func TestSetBroadcastSelfFalseAppliesToEveryJoin(t *testing.T) {
+	wsURL, joins := joinPayloadServer(t)
+
+	ch := newChannel("topic", wsURL)
+	defer ch.Close()
+	ch.SetBroadcastSelf(false)
+	if err := ch.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+
+	select {
+	case payload := <-joins:
+		if joinBroadcastSelf(t, payload) {
+			t.Fatal("initial join has broadcast.self=true after SetBroadcastSelf(false)")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for initial join")
+	}
+
+	ch.mu.Lock()
+	ws := ch.ws
+	ch.mu.Unlock()
+	if ws != nil {
+		ws.Close()
+	}
+
+	select {
+	case payload := <-joins:
+		if joinBroadcastSelf(t, payload) {
+			t.Fatal("reconnect join has broadcast.self=true after SetBroadcastSelf(false)")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for reconnect join")
+	}
+}
