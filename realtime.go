@@ -31,6 +31,10 @@ const (
 	joinReplyTimeout    = 10 * time.Second
 	initialReconnectGap = 500 * time.Millisecond
 	maxReconnectGap     = 30 * time.Second
+	// minStableConnection is how long a connection must survive before it counts
+	// as good enough to clear the reconnect backoff. Anything shorter is treated
+	// as a failed attempt: see reconnectWithBackoff.
+	minStableConnection = 5 * time.Second
 )
 
 var (
@@ -72,9 +76,16 @@ type Channel struct {
 	Origin    string
 	listeners []Listener
 
-	mu        sync.Mutex // protects ws, connected, listeners, accessToken
+	mu        sync.Mutex // protects ws, connected, listeners, accessToken, lastDisconnect
 	ws        *websocket.Conn
 	connected bool
+
+	// lastDisconnect records why the current connection ended. Every teardown
+	// path -- a read error, a server-sent phx_close/phx_error, a deadline --
+	// funnels into the same OnDisconnect, which carries no reason, so without
+	// this a flapping channel is indistinguishable from a cleanly closed one and
+	// there is nothing to diagnose it with. Read via LastDisconnectError.
+	lastDisconnect error
 
 	// accessToken is presented in the phx_join payload. Realtime v2.43+
 	// rejects a join that omits it (the server replies "Unknown Error on
@@ -522,10 +533,12 @@ func (c *Channel) handleCallbacks(ws *websocket.Conn) {
 	msg := make([]byte, maxMessageBytes)
 	for {
 		if err := ws.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			c.setLastDisconnect(fmt.Errorf("set read deadline: %w", err))
 			return
 		}
 		n, err := ws.Read(msg)
 		if err != nil {
+			c.setLastDisconnect(fmt.Errorf("read: %w", err))
 			return
 		}
 		message := &Message{}
@@ -543,6 +556,7 @@ func (c *Channel) handleCallbacks(ws *websocket.Conn) {
 		// "connected" while broadcasts go nowhere. Returning here lets the
 		// defer mark us disconnected and signal a fresh join via reconnectChan.
 		if message.Topic == c.Topic && (message.Event == phxClose || message.Event == phxError) {
+			c.setLastDisconnect(fmt.Errorf("server closed channel: event=%s payload=%v", message.Event, message.Payload))
 			return
 		}
 		c.mu.Lock()
@@ -592,6 +606,7 @@ func (c *Channel) keepAlive() {
 	}
 
 	gap := initialReconnectGap
+	connectedAt := time.Now() // the Listen() that got us here
 	heartbeat := time.NewTicker(5 * time.Second)
 	defer heartbeat.Stop()
 	for {
@@ -599,9 +614,29 @@ func (c *Channel) keepAlive() {
 		case <-c.closeChan:
 			return
 		case <-c.reconnectChan:
+			// A connection that did not last is the server dropping us on
+			// purpose (Phoenix inactivity reaper, a rate limit, an RLS
+			// revocation), and open() reports success every time that happens.
+			// reconnectWithBackoff only ever delays after a *failed* open, so on
+			// its own it never throttles this case at all: the retry becomes an
+			// unthrottled loop that hammers the server and flaps every
+			// OnConnect/OnDisconnect consumer several times a second. Pace the
+			// reattempt here instead, and clear the backoff only once a
+			// connection has proved it can stay up.
+			if time.Since(connectedAt) >= minStableConnection {
+				gap = initialReconnectGap
+			} else {
+				select {
+				case <-c.closeChan:
+					return
+				case <-time.After(gap):
+				}
+				gap = min(gap*2, maxReconnectGap)
+			}
 			if !c.reconnectWithBackoff(&gap) {
 				return
 			}
+			connectedAt = time.Now()
 		case <-heartbeat.C:
 			writeErr := func() error {
 				c.writeMu.Lock()
@@ -642,7 +677,6 @@ func (c *Channel) reconnectWithBackoff(gap *time.Duration) bool {
 		default:
 		}
 		if err := c.open(); err == nil {
-			*gap = initialReconnectGap
 			return true
 		}
 		select {
@@ -652,6 +686,23 @@ func (c *Channel) reconnectWithBackoff(gap *time.Duration) bool {
 		}
 		*gap = min(*gap*2, maxReconnectGap)
 	}
+}
+
+// setLastDisconnect records why the connection ended, for LastDisconnectError.
+func (c *Channel) setLastDisconnect(err error) {
+	c.mu.Lock()
+	c.lastDisconnect = err
+	c.mu.Unlock()
+}
+
+// LastDisconnectError returns why the most recent connection ended, or nil if
+// it ended cleanly (or none has yet). Safe to call from OnDisconnect, which is
+// the point: a consumer that only sees connect/disconnect callbacks otherwise
+// has no way to tell a server-side channel close from a dropped socket.
+func (c *Channel) LastDisconnectError() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastDisconnect
 }
 
 func (c *Channel) On(event string, callback func(*Channel, *Message)) {
