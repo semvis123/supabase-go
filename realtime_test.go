@@ -1053,3 +1053,97 @@ func TestSetBroadcastSelfFalseAppliesToEveryJoin(t *testing.T) {
 		t.Fatal("timed out waiting for reconnect join")
 	}
 }
+
+// TestJoinIsPublicByDefault pins that existing callers keep joining public
+// channels: a private join on a topic without RLS policies would be refused.
+func TestJoinIsPublicByDefault(t *testing.T) {
+	wsURL, joins := joinPayloadServer(t)
+
+	ch := newChannel("topic", wsURL)
+	defer ch.Close()
+	if err := ch.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+
+	select {
+	case payload := <-joins:
+		cfg, _ := payload["config"].(map[string]interface{})
+		if _, ok := cfg["private"]; ok {
+			t.Fatalf("default join carries config.private: %v", payload)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for join")
+	}
+}
+
+// TestSetPrivateMarksJoinPrivate covers the private-channel join: Realtime only
+// checks RLS on realtime.messages when config.private is true.
+func TestSetPrivateMarksJoinPrivate(t *testing.T) {
+	wsURL, joins := joinPayloadServer(t)
+
+	ch := newChannel("topic", wsURL)
+	defer ch.Close()
+	ch.SetPrivate(true)
+	if err := ch.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+
+	select {
+	case payload := <-joins:
+		cfg, _ := payload["config"].(map[string]interface{})
+		if cfg["private"] != true {
+			t.Fatalf("join config.private = %v, want true", cfg["private"])
+		}
+		if !joinBroadcastSelf(t, payload) {
+			t.Fatal("private join lost broadcast.self=true")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for join")
+	}
+}
+
+// TestSetHeaderIsSentOnEveryHandshake covers the header a poller authorizes a
+// private channel with (Realtime hands x-* handshake headers to RLS). It must
+// be sent on the first dial and on every reconnect, or a dropped socket would
+// rejoin unauthorized.
+func TestSetHeaderIsSentOnEveryHandshake(t *testing.T) {
+	headers := make(chan string, 8)
+	var conns atomic.Int32
+	srv := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		headers <- ws.Request().Header.Get("X-Tfckey")
+		if err := captureJoin(ws, make(chan map[string]interface{}, 1)); err != nil {
+			return
+		}
+		if conns.Add(1) == 1 {
+			// Drop the first connection so the channel reconnects.
+			ws.Close()
+			return
+		}
+		buf := make([]byte, 4096)
+		for {
+			_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if _, err := ws.Read(buf); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	ch := newChannel("topic", "ws"+strings.TrimPrefix(srv.URL, "http"))
+	defer ch.Close()
+	ch.SetHeader("x-tfckey", "the-key")
+	if err := ch.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+
+	for i, name := range []string{"initial", "reconnect"} {
+		select {
+		case got := <-headers:
+			if got != "the-key" {
+				t.Fatalf("%s handshake x-tfckey = %q, want %q", name, got, "the-key")
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatalf("timed out waiting for handshake %d (%s)", i+1, name)
+		}
+	}
+}
