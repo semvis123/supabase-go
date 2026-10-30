@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	neturl "net/url"
 	"strconv"
 	"strings"
@@ -89,6 +90,17 @@ type Channel struct {
 	// keeps the historical self=true behaviour. Guarded by mu.
 	noBroadcastSelf bool
 
+	// private joins with config.private=true, so Realtime authorizes the
+	// join (and every broadcast sent on it) against the RLS policies on
+	// realtime.messages. A private channel never shares messages with a
+	// public one of the same topic. Guarded by mu.
+	private bool
+
+	// header holds extra headers sent on the websocket handshake. Realtime
+	// copies the x-* ones into request.headers, where RLS policies can read
+	// them. Guarded by mu.
+	header http.Header
+
 	// openMu serializes open() so concurrent callers don't each create a
 	// fresh dial+OnConnect cycle for the same logical connect.
 	openMu sync.Mutex
@@ -160,6 +172,33 @@ func (c *Channel) SetBroadcastSelf(self bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.noBroadcastSelf = !self
+}
+
+// SetPrivate makes the channel join as a private channel (the join config's
+// private flag). Realtime then checks the RLS policies on realtime.messages
+// before accepting the join and before relaying anything sent on it, and keeps
+// its messages apart from a public channel of the same topic. The value is
+// read when the join is built, so it applies to the initial connect and to
+// every reconnect; call it before Listen(). Safe to call concurrently.
+func (c *Channel) SetPrivate(private bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.private = private
+}
+
+// SetHeader sets a header sent on the websocket handshake, replacing any
+// earlier value for key. Realtime passes headers whose name starts with "x-"
+// to RLS as request.headers, so a policy can authorize a private channel on
+// something other than the JWT. Headers are read when the socket is dialled,
+// so they apply to the initial connect and to every reconnect; call it before
+// Listen(). Safe to call concurrently.
+func (c *Channel) SetHeader(key, value string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.header == nil {
+		c.header = http.Header{}
+	}
+	c.header.Set(key, value)
 }
 
 type Listener struct {
@@ -354,6 +393,11 @@ func (c *Channel) open() error {
 		return err
 	}
 	cfg.Dialer = &net.Dialer{Timeout: dialTimeout}
+	c.mu.Lock()
+	if c.header != nil {
+		cfg.Header = c.header.Clone()
+	}
+	c.mu.Unlock()
 
 	newWs, err := c.dial(cfg)
 	if err != nil {
@@ -364,13 +408,18 @@ func (c *Channel) open() error {
 	c.mu.Lock()
 	token := c.accessToken
 	self := !c.noBroadcastSelf
+	private := c.private
 	c.mu.Unlock()
-	joinPayload := map[string]interface{}{
-		"config": map[string]interface{}{
-			"broadcast": map[string]interface{}{
-				"self": self,
-			},
+	config := map[string]interface{}{
+		"broadcast": map[string]interface{}{
+			"self": self,
 		},
+	}
+	if private {
+		config["private"] = true
+	}
+	joinPayload := map[string]interface{}{
+		"config": config,
 	}
 	if token != "" {
 		joinPayload["access_token"] = token
